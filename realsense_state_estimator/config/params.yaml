@@ -1,0 +1,23 @@
+state_estimator_node:
+  ros__parameters:
+    # combined: subscribe to /camera/camera/imu (sensor_msgs/Imu)
+    # split:    subscribe to /camera/camera/accel/sample + /gyro/sample
+    imu_mode: combined
+    imu_topic: /camera/camera/imu
+    accel_topic: /camera/camera/accel/sample
+    gyro_topic: /camera/camera/gyro/sample
+
+    # Currently only 'identity' is implemented. Future: madgwick, complementary, ekf.
+    estimator_type: identity
+
+    odom_frame: odom
+    base_frame: base_link
+    imu_frame: camera_imu_optical_frame
+
+    publish_tf: true
+    publish_odometry: true
+    odom_topic: /state_estimator/odometry
+    publish_rate_hz: 50.0
+
+    queue_size: 100
+    debug_log: false

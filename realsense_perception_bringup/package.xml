@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>realsense_perception_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Top-level launch + RViz config that brings up the RealSense state
+    estimator and the local elevation mapper together.
+  </description>
+  <maintainer email="dev@sequorrobotics.com">sequor</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>realsense_elevation_mapper</exec_depend>
+  <exec_depend>realsense_state_estimator</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
