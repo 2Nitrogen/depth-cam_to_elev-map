@@ -14,13 +14,21 @@ def generate_launch_description() -> LaunchDescription:
         default_value=default_params,
         description='Path to params yaml',
     )
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use /clock (e.g. when replaying a rosbag with --clock).',
+    )
 
     node = Node(
         package='realsense_state_estimator',
         executable='state_estimator_node',
         name='state_estimator_node',
         output='screen',
-        parameters=[LaunchConfiguration('params_file')],
+        parameters=[
+            LaunchConfiguration('params_file'),
+            {'use_sim_time': LaunchConfiguration('use_sim_time')},
+        ],
     )
 
-    return LaunchDescription([params_file_arg, node])
+    return LaunchDescription([params_file_arg, use_sim_time_arg, node])

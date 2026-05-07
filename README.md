@@ -102,6 +102,65 @@ ros2 launch realsense_perception_bringup bringup.launch.py
 
 ---
 
+## Rosbag 재생 시 주의사항
+
+라이브 카메라가 아니라 `ros2 bag play`로 데이터를 흘릴 때는 시간/TF 관련
+함정이 두 개 있다. 둘 다 한 번 겪으면 끝나지만 한 번에 진단하기 어렵다.
+
+### 1. 시간축 통일: `--clock` + `use_sim_time:=true`
+
+bag의 메시지에는 녹화 당시의 timestamp가 박혀 있고, 노드가 발행하는
+TF/Odometry는 **현재** 시간으로 stamp된다. 그냥 재생하면 두 시간축이
+완전히 분리되어 TF lookup이 항상 실패한다 (수 시간~수십 시간 갭).
+
+올바른 실행:
+
+```bash
+# 터미널 A
+ros2 bag play <bag_path> --clock 100
+
+# 터미널 B
+ros2 launch realsense_perception_bringup bringup.launch.py use_sim_time:=true
+```
+
+### 2. RealSense의 sensor-time vs record-time 미스매치
+
+`--clock` + `use_sim_time:=true`까지 해도 cloud header.stamp와 `/clock`
+사이에 **수 초 단위 일정한 갭**이 남을 수 있다. 이건 RealSense ROS2
+wrapper가 기본적으로 메시지를 **센서 하드웨어 시간**으로 stamp하기
+때문이다. `--clock`은 bag의 record 시점(시스템 시간) 기준으로 발행되므로
+두 시간이 어긋난다.
+
+**근본 해결**: bag을 다시 녹화할 때 wrapper에 `use_ros_time:=true` 옵션을 줘서
+시스템 시간으로 stamp되게 한다.
+```bash
+ros2 launch realsense2_camera rs_launch.py ... use_ros_time:=true
+```
+
+**이미 녹화된 bag으로 prototyping할 때**: elevation_mapper의
+`use_latest_tf` 파라미터를 true로 둔다 (기본값). cloud의 stamp 무시하고
+가장 최신 TF로 lookup하므로 갭에 영향받지 않음. 단, estimator가 시간에
+따라 변하는 motion을 발행하기 시작하면 (Madgwick/EKF 등 도입 후)
+부정확해지므로 그 시점엔 false로 바꾼다.
+
+### 3. TF 트리 분리 확인
+
+bag에는 보통 `camera_link → camera_*_frame` 만 들어 있고, state_estimator는
+`odom → base_link` 만 발행한다. `base_link ↔ camera_link`를 잇는 transform이
+어디에도 없으면 두 트리가 분리된다.
+
+확인:
+```bash
+ros2 run tf2_tools view_frames    # 트리 PDF 생성
+# 또는
+ros2 run tf2_ros tf2_echo base_link camera_link
+```
+
+연결되어 있지 않으면 데스크탑 데모용으로 위 "TF 주의" 박스의
+static_transform_publisher 한 줄을 추가로 띄운다.
+
+---
+
 ## 향후 기능 추가 가이드
 
 ### A. 실제 state estimator 추가 (Madgwick / complementary / EKF / VIO)

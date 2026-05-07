@@ -21,17 +21,24 @@ def generate_launch_description() -> LaunchDescription:
         'rviz', default_value='true',
         description='Launch RViz with the default perception config.',
     )
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time', default_value='false',
+        description='Use /clock (e.g. when replaying a rosbag with --clock).',
+    )
+    use_sim_time = LaunchConfiguration('use_sim_time')
 
     estimator_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution(
             [estimator_pkg, 'launch', 'state_estimator.launch.py']
         )),
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
     )
 
     mapper_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution(
             [mapper_pkg, 'launch', 'local_elevation_mapper.launch.py']
         )),
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
     )
 
     rviz_node = Node(
@@ -42,12 +49,14 @@ def generate_launch_description() -> LaunchDescription:
             '-d',
             PathJoinSubstitution([bringup_pkg, 'rviz', 'default.rviz']),
         ],
+        parameters=[{'use_sim_time': use_sim_time}],
         condition=IfCondition(LaunchConfiguration('rviz')),
         output='screen',
     )
 
     return LaunchDescription([
         rviz_arg,
+        use_sim_time_arg,
         estimator_launch,
         mapper_launch,
         rviz_node,

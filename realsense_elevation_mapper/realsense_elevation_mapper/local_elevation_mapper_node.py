@@ -14,6 +14,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 
 import tf2_ros
@@ -52,6 +53,10 @@ class LocalElevationMapperNode(Node):
         self.declare_parameter('min_points_per_cell', 1)
         self.declare_parameter('cloud_queue_size', 5)
         self.declare_parameter('tf_timeout_sec', 0.1)
+        # When true, use the latest available TF instead of msg.header.stamp.
+        # Useful when replaying a bag whose message stamps don't match /clock
+        # (e.g. RealSense sensor hardware time vs bag record time).
+        self.declare_parameter('use_latest_tf', True)
 
         p = self.get_parameter
         self.input_cloud_topic = p('input_cloud_topic').value
@@ -73,6 +78,7 @@ class LocalElevationMapperNode(Node):
         self.min_points_per_cell = int(p('min_points_per_cell').value)
         self.cloud_queue_size = int(p('cloud_queue_size').value)
         self.tf_timeout = Duration(seconds=float(p('tf_timeout_sec').value))
+        self.use_latest_tf = bool(p('use_latest_tf').value)
 
         self.grid_spec = make_grid_spec(
             self.x_min, self.x_max, self.y_min, self.y_max, self.resolution,
@@ -106,10 +112,41 @@ class LocalElevationMapperNode(Node):
         )
 
     def _on_cloud(self, msg: PointCloud2) -> None:
+        # TF lookup time policy.
+        #
+        # When use_latest_tf is True we look up the most recent available
+        # transform (Time() = zero-time = "latest" in tf2) instead of the
+        # one matching msg.header.stamp. This is the right default for two
+        # common situations encountered with this stack:
+        #
+        # (a) Rosbag playback. The RealSense ROS2 wrapper stamps messages
+        #     with sensor *hardware* time by default (i.e. unless launched
+        #     with use_ros_time:=true at record time). When the bag is
+        #     replayed with `ros2 bag play --clock`, /clock advances in
+        #     bag-record (= recorder system) time, but each message's
+        #     header.stamp still carries sensor hardware time. The two
+        #     clocks are offset by a constant (often a few seconds), so
+        #     looking up TF at msg.header.stamp always lands outside the
+        #     buffer and fails as ExtrapolationException. There is no
+        #     post-hoc fix in the bag — re-record with use_ros_time:=true
+        #     if you need accurate per-cloud TF interpolation.
+        #
+        # (b) Identity / placeholder state estimator. While the estimator
+        #     in realsense_state_estimator is IdentityStateEstimator, the
+        #     odom -> base_link TF is constant. Per-frame interpolation
+        #     gives nothing extra, so latest-TF is equivalent and avoids
+        #     spurious extrapolation warnings during startup races.
+        #
+        # Set use_latest_tf=False once both hold:
+        #   - a real estimator (Madgwick/EKF/VIO) is publishing meaningful
+        #     time-varying motion on odom -> base_link, AND
+        #   - cloud and TF live in the same time domain (live camera with
+        #     use_ros_time:=true, or a bag recorded that way).
+        lookup_time = Time() if self.use_latest_tf else msg.header.stamp
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.target_frame, msg.header.frame_id,
-                msg.header.stamp, timeout=self.tf_timeout,
+                lookup_time, timeout=self.tf_timeout,
             )
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
@@ -118,6 +155,11 @@ class LocalElevationMapperNode(Node):
                 f'TF lookup failed ({msg.header.frame_id} -> {self.target_frame}): {e}'
             )
             return
+
+        out_stamp = (
+            self.get_clock().now().to_msg()
+            if self.use_latest_tf else msg.header.stamp
+        )
 
         pts = pointcloud2_to_xyz(msg)
         if pts.size == 0:
@@ -141,7 +183,7 @@ class LocalElevationMapperNode(Node):
 
         if self.publish_accumulated_cloud:
             self.pub_accum.publish(
-                xyz_to_pointcloud2(accumulated, self.target_frame, msg.header.stamp)
+                xyz_to_pointcloud2(accumulated, self.target_frame, out_stamp)
             )
 
         if self.publish_elevation_cloud:
@@ -151,7 +193,7 @@ class LocalElevationMapperNode(Node):
                 min_points_per_cell=self.min_points_per_cell,
             )
             self.pub_elev.publish(
-                xyz_to_pointcloud2(elev_pts, self.target_frame, msg.header.stamp)
+                xyz_to_pointcloud2(elev_pts, self.target_frame, out_stamp)
             )
 
 

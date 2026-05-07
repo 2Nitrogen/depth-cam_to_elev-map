@@ -171,6 +171,13 @@ class StateEstimatorNode(Node):
 
     # ----- publish tick -----
     def _on_publish_tick(self) -> None:
+        # self.get_clock() respects the use_sim_time parameter:
+        #   - use_sim_time=False -> system time (live camera scenario)
+        #   - use_sim_time=True  -> /clock topic (rosbag --clock scenario)
+        # Both the timer firing and this stamp must come from the same
+        # source so the TF buffer of downstream consumers is internally
+        # consistent. Do not mix in time.time() or rclpy.clock.Clock()
+        # constructors here — they bypass use_sim_time.
         now = self.get_clock().now()
         self.estimator.predict(now.nanoseconds * 1e-9)
         pose = self.estimator.get_pose()

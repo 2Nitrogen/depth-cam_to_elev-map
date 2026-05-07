@@ -24,3 +24,8 @@ local_elevation_mapper_node:
     min_points_per_cell: 1
     cloud_queue_size: 5
     tf_timeout_sec: 0.1
+    # When true, use latest available TF instead of cloud's header.stamp.
+    # Required when bag stamps and /clock are mismatched (common with rosbags
+    # recorded in RealSense sensor-time mode). Set to false for live cameras
+    # with consistent timestamps when accurate per-frame TF interpolation matters.
+    use_latest_tf: true
