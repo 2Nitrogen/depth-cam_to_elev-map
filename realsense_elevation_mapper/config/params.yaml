@@ -21,6 +21,11 @@ local_elevation_mapper_node:
     publish_accumulated_cloud: true
     publish_elevation_cloud: true
 
+    # Currently false for ROI-bounds inspection (see the accumulated cloud
+    # in RViz, decide proper x/y/z bounds, then re-enable). Production
+    # should be true.
+    enable_roi_crop: false
+
     min_points_per_cell: 1
     cloud_queue_size: 5
     tf_timeout_sec: 0.1

@@ -46,6 +46,15 @@ class LocalElevationMapperNode(Node):
         self.declare_parameter('y_max', 1.0)
         self.declare_parameter('z_min', -0.5)
         self.declare_parameter('z_max', 1.0)
+        # When false, ROI cropping is skipped: every transformed point goes
+        # into the accumulated buffer regardless of x_min/x_max/.. bounds.
+        # Useful during bring-up to inspect the raw scene in RViz and decide
+        # appropriate crop bounds. The elevation grid still uses the
+        # configured map_length / resolution and silently drops points
+        # outside it — widen those if you want a full-coverage elevation
+        # cloud too. Re-enable for production: cropping is what keeps the
+        # accumulated buffer small enough to grid-bin every callback.
+        self.declare_parameter('enable_roi_crop', True)
 
         self.declare_parameter('publish_accumulated_cloud', True)
         self.declare_parameter('publish_elevation_cloud', True)
@@ -75,6 +84,7 @@ class LocalElevationMapperNode(Node):
 
         self.publish_accumulated_cloud = bool(p('publish_accumulated_cloud').value)
         self.publish_elevation_cloud = bool(p('publish_elevation_cloud').value)
+        self.enable_roi_crop = bool(p('enable_roi_crop').value)
         self.min_points_per_cell = int(p('min_points_per_cell').value)
         self.cloud_queue_size = int(p('cloud_queue_size').value)
         self.tf_timeout = Duration(seconds=float(p('tf_timeout_sec').value))
@@ -166,12 +176,13 @@ class LocalElevationMapperNode(Node):
             return
 
         pts = transform_points(pts, tf)
-        pts = crop_roi(
-            pts,
-            self.x_min, self.x_max,
-            self.y_min, self.y_max,
-            self.z_min, self.z_max,
-        )
+        if self.enable_roi_crop:
+            pts = crop_roi(
+                pts,
+                self.x_min, self.x_max,
+                self.y_min, self.y_max,
+                self.z_min, self.z_max,
+            )
 
         self.cloud_buffer.append(pts)
 
