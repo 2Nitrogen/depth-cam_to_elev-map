@@ -1,64 +1,81 @@
 # realsense_pcd_to_elev_map
 
-RealSense depth camera에서 출력되는 PointCloud2 / IMU 토픽을 받아 local
-elevation map을 만들고 RViz로 시각화하는 ROS2 perception 스택. 본 폴더가
-colcon 워크스페이스의 `src/` 역할을 한다.
+This repository is a ROS2 perception software stack that builds a local
+elevation map from the PointCloud2 / IMU topics published by a RealSense
+depth camera. The repository root doubles as the `src/` directory of a
+colcon workspace.
 
-상세 설계 문서:
-- 전체 elevation mapper 설계: [realsense_elevation_map_task_plan.md](realsense_elevation_map_task_plan.md)
-- IMU/state estimation 추가 설계: `~/.claude/plans/realsense-misty-meteor.md`
+Detailed design documents:
+- Overall elevation mapper design: [realsense_elevation_map_task_plan.md](realsense_elevation_map_task_plan.md)
+- IMU / state estimation design: `~/.claude/plans/realsense-misty-meteor.md`
 
 ---
 
-## 패키지 구성
+## Packages
 
 ```
 realsense_pcd_to_elev_map/                  (colcon workspace src)
 ├─ realsense_elevation_mapper/              (1) PointCloud2 → elevation grid
-├─ realsense_state_estimator/               (2) IMU 구독 + state estimation 스켈레톤
-└─ realsense_perception_bringup/            (3) 통합 launch + RViz config
+├─ realsense_state_estimator/               (2) IMU subscription + state estimation skeleton
+└─ realsense_perception_bringup/            (3) combined bring-up launch + RViz config
 ```
 
 ### (1) `realsense_elevation_mapper` (C++)
 
-`PointCloud2`를 구독하여 최근 k개 프레임을 누적, 2D grid에 평균 z로 binning,
-결과를 PointCloud2로 발행. **C++ (rclcpp + PCL + Eigen)** 으로 작성. 이 패키지만
-C++인 이유는 PointCloud2 hot path 성능과 PCL 생태계 활용 때문 (자세히는
-[패키지 README](realsense_elevation_mapper/README.md)).
+Subscribes to `PointCloud2`, accumulates the latest k frames, bins them
+into a 2D grid, and publishes the result as PointCloud2. Implemented in
+**C++ (rclcpp + PCL + Eigen)** — this is the hot path of the stack and
+also where the planned follow-on features (normal estimation, foothold
+scoring, voxel downsampling, ...) naturally live in the PCL/Eigen
+ecosystem. See
+[realsense_elevation_mapper/README.md](realsense_elevation_mapper/README.md)
+for details.
 
-핵심 파일:
-- [src/local_elevation_mapper_node.cpp](realsense_elevation_mapper/src/local_elevation_mapper_node.cpp) — 노드 본체
-- [src/elevation_grid.cpp](realsense_elevation_mapper/src/elevation_grid.cpp) — grid binning + 평균 elevation 계산
-- [src/pointcloud_utils.cpp](realsense_elevation_mapper/src/pointcloud_utils.cpp) — ROI crop
-- [include/realsense_elevation_mapper/](realsense_elevation_mapper/include/realsense_elevation_mapper/) — 헤더
-- [CMakeLists.txt](realsense_elevation_mapper/CMakeLists.txt) — 빌드 설정
-- [config/params.yaml](realsense_elevation_mapper/config/params.yaml) — 모든 파라미터
+Core files:
+- [src/main.cpp](realsense_elevation_mapper/src/main.cpp) — Entry point (`rclcpp::init` + spin)
+- [src/local_elevation_mapper_node.cpp](realsense_elevation_mapper/src/local_elevation_mapper_node.cpp) — Node implementation (subs/pubs/TF)
+- [src/elevation_grid.cpp](realsense_elevation_mapper/src/elevation_grid.cpp) — Grid binning + mean elevation
+- [src/pointcloud_utils.cpp](realsense_elevation_mapper/src/pointcloud_utils.cpp) — ROI crop on PCL clouds
+- [include/realsense_elevation_mapper/](realsense_elevation_mapper/include/realsense_elevation_mapper/) — Public headers
+- [CMakeLists.txt](realsense_elevation_mapper/CMakeLists.txt) — Build configuration
+- [config/params.yaml](realsense_elevation_mapper/config/params.yaml) — Parameters
 
-TF 변환은 `tf2_eigen` + `pcl::transformPointCloud`을 사용 (Python에서 수동
-homogeneous matrix를 만들던 `tf_utils.py`는 더 이상 불필요).
+TF application is handled via `tf2_eigen` + `pcl::transformPointCloud`, so
+no equivalent of the old `tf_utils.py` is needed.
+
+Extra system dependencies for this package (beyond a ROS2 desktop install):
+`ros-humble-pcl-conversions`, `ros-humble-tf2-eigen`,
+`ros-humble-tf2-sensor-msgs`, `libpcl-dev`, `libeigen3-dev`. With `rosdep`
+installed, `rosdep install --from-paths . --ignore-src -y` at the
+workspace root pulls these in automatically.
 
 ### (2) `realsense_state_estimator`
 
-RealSense IMU 토픽을 구독하고, 추상 인터페이스 `StateEstimatorBase`를 거쳐
-TF (`odom -> base_link`) + `nav_msgs/Odometry`를 발행. **현재는 placeholder
-(IdentityStateEstimator)** 만 들어 있어 항상 origin + identity orientation을
-보고한다. 자세히는 [패키지 README](realsense_state_estimator/README.md).
+Subscribes to the RealSense IMU topic and publishes TF
+(`odom -> base_link`) + `nav_msgs/Odometry` through the
+`StateEstimatorBase` interface. **Currently a placeholder
+(IdentityStateEstimator).** See
+[realsense_state_estimator/README.md](realsense_state_estimator/README.md)
+for details.
 
-핵심 파일:
-- [state_estimator_node.py](realsense_state_estimator/realsense_state_estimator/state_estimator_node.py) — 노드 본체 (subs/pubs/timer)
-- [estimators/base.py](realsense_state_estimator/realsense_state_estimator/estimators/base.py) — `StateEstimatorBase` 추상 인터페이스 + `Pose`/`Twist` dataclass
-- [estimators/identity.py](realsense_state_estimator/realsense_state_estimator/estimators/identity.py) — placeholder 구현
+Core files:
+- [state_estimator_node.py](realsense_state_estimator/realsense_state_estimator/state_estimator_node.py) — Core node (subs/pubs/timer)
+- [estimators/base.py](realsense_state_estimator/realsense_state_estimator/estimators/base.py) — `StateEstimatorBase` interface + `Pose`/`Twist` dataclass
+- [estimators/identity.py](realsense_state_estimator/realsense_state_estimator/estimators/identity.py) — Placeholder
 - [imu_utils.py](realsense_state_estimator/realsense_state_estimator/imu_utils.py) — `sensor_msgs/Imu` → numpy
 - [config/params.yaml](realsense_state_estimator/config/params.yaml) — IMU mode, frame, rate
 
 ### (3) `realsense_perception_bringup`
 
-(1)+(2) 동시 실행 launch + RViz preset. RealSense 카메라 wrapper 자체는
-포함하지 않으며 별도로 실행한다고 가정. 자세히는 [패키지 README](realsense_perception_bringup/README.md).
+A combined launch that brings up (1) and (2) together with a preset RViz
+config. It does not include the RealSense camera wrapper itself; that is
+expected to be running separately. See
+[realsense_perception_bringup/README.md](realsense_perception_bringup/README.md)
+for details.
 
 ---
 
-## 데이터 흐름
+## Data Flow
 
 ```
 RealSense ROS2 wrapper
@@ -78,50 +95,53 @@ RealSense ROS2 wrapper
                  RViz
 ```
 
-두 노드는 **TF만으로 결합**된다. 추후 estimator를 EKF/VIO로 교체해도
-elevation mapper 코드는 변하지 않는다.
+The two nodes are **coupled only through TF**. Even when the estimator is
+later swapped out for an EKF/VIO implementation, the elevation mapper
+code does not have to change.
 
 ---
 
-## 환경 셋업 / 의존성
+## Environment setup / dependencies
 
-`realsense_elevation_mapper`는 **C++ (rclcpp + PCL + Eigen)** 으로 작성되어
-있어 시스템 라이브러리 의존성이 있다. 다른 두 패키지는 Python (rclpy + numpy)이라
-ROS2 desktop 설치가 되어 있으면 추가 작업이 거의 없다.
+`realsense_elevation_mapper` is written in **C++ (rclcpp + PCL + Eigen)**
+and therefore pulls in a few system libraries. The other two packages
+are Python (rclpy + numpy), so a ROS2 desktop install is essentially
+enough for them.
 
-### 검증된 플랫폼
+### Verified platform
 
 - **OS**: Ubuntu 22.04 LTS
 - **ROS2**: Humble Hawksbill
-- 다른 distro / OS 조합은 미검증. PCL 버전 차이로 인한 CMake 정책 경고가
-  나타날 수 있다.
+- Other distro / OS combinations are unverified. CMake policy warnings
+  due to PCL version differences may appear.
 
-### 한 번에 설치 (rosdep)
+### One-shot install (rosdep)
 
-`package.xml`에 모든 의존성이 선언되어 있으므로 워크스페이스에서 `rosdep`을
-돌리는 게 가장 권장된다.
+All dependencies are declared in each `package.xml`, so the most
+straightforward path is to run `rosdep` at the workspace root.
 
 ```bash
-# 첫 사용이면 rosdep 초기화
+# First-time setup of rosdep
 sudo apt install python3-rosdep
-sudo rosdep init      # 이미 했으면 스킵 (에러 무시 가능)
+sudo rosdep init      # skip if already initialized (error is harmless)
 rosdep update
 
-# 워크스페이스 의존성 일괄 설치
+# Install all workspace dependencies at once
 cd /home/sequor/realsense_pcd_to_elev_map
 rosdep install --from-paths . --ignore-src -y -r
 ```
 
-`-r`는 일부 실패해도 계속 진행. RealSense ROS2 wrapper(`realsense2_camera`)는
-rosdep으로도 받을 수 있지만, 보통 별도로 설치한다.
+`-r` keeps going even if some keys fail. The RealSense ROS2 wrapper
+(`realsense2_camera`) can also come in via rosdep, but it is more
+commonly installed on its own.
 
-### 수동 설치 (rosdep 안 쓸 때)
+### Manual install (when not using rosdep)
 
 ```bash
-# 빌드 도구
+# Build tooling
 sudo apt install python3-colcon-cmake python3-colcon-ros
 
-# C++ elevation_mapper 의존성
+# C++ elevation_mapper dependencies
 sudo apt install \
     ros-humble-pcl-conversions \
     ros-humble-tf2-eigen \
@@ -129,68 +149,69 @@ sudo apt install \
     libpcl-dev \
     libeigen3-dev
 
-# Python 패키지 의존성 (보통 desktop install에 포함되지만 확인용)
+# Python package dependencies (usually present in desktop install; listed for completeness)
 sudo apt install \
     ros-humble-sensor-msgs-py \
     ros-humble-rclpy \
     ros-humble-tf2-ros-py \
     python3-numpy
 
-# (선택) RealSense ROS2 wrapper
+# (optional) RealSense ROS2 wrapper
 sudo apt install ros-humble-realsense2-camera
 ```
 
-#### 각 의존성이 무엇 때문에 필요한지
+#### What each dependency is for
 
-| 패키지                       | 어디서 쓰는지                                      |
-|-----------------------------|---------------------------------------------------|
-| `ros-humble-pcl-conversions`| `pcl::fromROSMsg` / `pcl::toROSMsg` — PointCloud2 ↔ PCL |
-| `ros-humble-tf2-eigen`      | `tf2::transformToEigen` — TF → Eigen::Affine 변환      |
-| `ros-humble-tf2-sensor-msgs`| sensor_msgs 메시지에 TF 적용                           |
-| `libpcl-dev`                | `pcl::PointCloud`, `pcl::transformPointCloud`, NaN 필터 |
-| `libeigen3-dev`             | matrix/vector 연산                                     |
-| `python3-colcon-cmake`      | ament_cmake 패키지 빌드 (없으면 elevation_mapper가 colcon 인식에서 누락된다) |
-| `python3-colcon-ros`        | ROS2 패키지 자동 인식                                  |
+| Package                       | Used by                                                        |
+|-------------------------------|----------------------------------------------------------------|
+| `ros-humble-pcl-conversions`  | `pcl::fromROSMsg` / `pcl::toROSMsg` — PointCloud2 ↔ PCL        |
+| `ros-humble-tf2-eigen`        | `tf2::transformToEigen` — TF → Eigen::Affine conversion        |
+| `ros-humble-tf2-sensor-msgs`  | Applying TF to `sensor_msgs` messages                          |
+| `libpcl-dev`                  | `pcl::PointCloud`, `pcl::transformPointCloud`, NaN filtering   |
+| `libeigen3-dev`               | Matrix / vector math                                           |
+| `python3-colcon-cmake`        | Building `ament_cmake` packages (without it, `elevation_mapper` is silently dropped from colcon's view) |
+| `python3-colcon-ros`          | ROS2 package auto-detection                                    |
 
-> **함정 주의**: `python3-colcon-cmake`가 없으면 colcon이 ament_cmake 패키지를
-> 조용히 무시한다. `colcon build`는 통과한 것처럼 보이지만 elevation_mapper나
-> bringup 패키지가 빌드 산출물에 빠져 있다. `colcon list`로 모든 패키지가 보이는지
-> 우선 확인할 것.
+> **Gotcha**: without `python3-colcon-cmake`, colcon silently ignores
+> `ament_cmake` packages. `colcon build` looks like it succeeded, but
+> `elevation_mapper` / `bringup` are missing from the build artifacts.
+> Verify with `colcon list` first that all packages are visible.
 
-### 첫 빌드 검증
+### First-build sanity check
 
-의존성 설치 후 클린 빌드로 확인:
+After installing deps, a clean build is the surest verification:
 
 ```bash
 cd /home/sequor/realsense_pcd_to_elev_map
-rm -rf build install log     # 옛 산출물 제거
+rm -rf build install log     # wipe old artifacts
 colcon build
 source install/setup.bash
-colcon list                  # 3개 패키지 모두 보여야 정상
+colcon list                  # all 3 packages must show up
 ```
 
-기대 결과:
+Expected output:
 ```
 realsense_elevation_mapper      realsense_elevation_mapper      (ros.ament_cmake)
 realsense_perception_bringup    realsense_perception_bringup    (ros.ament_cmake)
 realsense_state_estimator       realsense_state_estimator       (ros.ament_python)
 ```
 
-C++ 패키지 첫 빌드는 PCL 헤더가 무거워 30–60초 걸린다. 두 번째부터는 변경된
-패키지만 짧게 빌드된다 (`--packages-select`).
+The first C++ build takes 30–60 s because of PCL headers; subsequent
+incremental builds (with `--packages-select`) are fast.
 
-### 흔한 빌드 에러
+### Common build errors
 
-- **`pcl_conversionsConfig.cmake not found`** → `ros-humble-pcl-conversions` 미설치.
-- **`fatal error: Eigen/Core: No such file or directory`** → `libeigen3-dev` 미설치.
-- **`undefined reference to pcl::...`** → libpcl 일부만 설치된 경우. `libpcl-dev` (메타 패키지) 설치.
-- **`CMP0144` / `CMP0167` / `CMP0074` dev 경고** → 무시 가능. PCL 자체의 CMake 정책 문제로 사용자 코드와 무관.
-- **`colcon build` 가 "Summary: 0 packages finished"** → `python3-colcon-cmake` 미설치 가능성. `colcon list`로 확인.
+- **`pcl_conversionsConfig.cmake not found`** → `ros-humble-pcl-conversions` is not installed.
+- **`fatal error: Eigen/Core: No such file or directory`** → `libeigen3-dev` is not installed.
+- **`undefined reference to pcl::...`** → only part of libpcl is installed. Install the `libpcl-dev` meta-package.
+- **`CMP0144` / `CMP0167` / `CMP0074` dev warnings** → safe to ignore; these are PCL's own CMake policy quirks, unrelated to user code.
+- **`colcon build` finishes with `Summary: 0 packages finished`** → likely `python3-colcon-cmake` missing. Verify with `colcon list`.
 
-### 온보드 이식 시 메모
+### Notes on onboard porting
 
-Jetson 클래스 (Orin/Nano) Ubuntu 22.04 + ROS2 humble 조합이라면 위와 동일하게
-설치된다. `arm64` 빌드는 더 오래 걸리지만 코드 수정은 불필요.
+A Jetson-class board (Orin / Nano) with Ubuntu 22.04 + ROS2 Humble
+follows exactly the same recipe. `arm64` builds take longer but no
+source changes are required.
 
 ---
 
@@ -201,91 +222,110 @@ cd /home/sequor/realsense_pcd_to_elev_map
 colcon build
 source install/setup.bash
 
-# 1. RealSense 카메라 (별도 터미널)
+# 1. RealSense camera (separate terminal)
 ros2 launch realsense2_camera rs_launch.py \
     pointcloud.enable:=true enable_gyro:=true enable_accel:=true unite_imu_method:=2
 
-# 2. perception 스택 + RViz
+# 2. Perception stack + RViz
 ros2 launch realsense_perception_bringup bringup.launch.py
 ```
 
-> **TF 주의**: RealSense 카메라 frame을 `base_link`에 연결하는 static
-> transform이 필요하다. 데스크탑 데모라면 한 줄로 충분:
-> ```bash
-> ros2 run tf2_ros static_transform_publisher \
->     --x 0 --y 0 --z 0 --frame-id base_link --child-frame-id camera_link
-> ```
-> 실제 로봇이라면 URDF / robot_state_publisher가 이를 제공한다.
+The bringup takes a `source:=` argument that selects the data source.
+`source:=live` (the default) runs against a live RealSense camera as
+above. `source:=rosbag` is described below.
+
+> **TF note**: a static transform connecting the RealSense camera frame to
+> `base_link` is required. On an actual robot, the URDF /
+> robot_state_publisher provides it. For a rosbag-replay workflow without
+> a URDF, launch with `source:=rosbag` — the bringup then publishes that
+> static TF itself, reading translation / RPY from
+> [`realsense_perception_bringup/config/camera_mount.json`](realsense_perception_bringup/config/camera_mount.json).
+> The shipped defaults are all zeros (identity), which is fine for a
+> desktop demo; edit the file (or override via
+> `camera_mount_config:=/path/to/custom.json`) with the actual mount
+> values for your robot.
 
 ---
 
-## Rosbag 재생 시 주의사항
+## Caveats when replaying rosbags
 
-라이브 카메라가 아니라 `ros2 bag play`로 데이터를 흘릴 때는 시간/TF 관련
-함정이 두 개 있다. 둘 다 한 번 겪으면 끝나지만 한 번에 진단하기 어렵다.
+When data is replayed through `ros2 bag play` instead of a live camera,
+there are two time / TF traps. Both are obvious once you've hit them but
+tricky to diagnose the first time.
 
-### 1. 시간축 통일: `--clock` + `use_sim_time:=true`
+### 1. Aligning the time domain: `--clock` + `use_sim_time:=true`
 
-bag의 메시지에는 녹화 당시의 timestamp가 박혀 있고, 노드가 발행하는
-TF/Odometry는 **현재** 시간으로 stamp된다. 그냥 재생하면 두 시간축이
-완전히 분리되어 TF lookup이 항상 실패한다 (수 시간~수십 시간 갭).
+Bag messages carry the timestamps from when they were recorded, while the
+TF / Odometry published by the nodes is stamped with the **current** time.
+Replay them naively and the two time axes are completely disjoint, so TF
+lookups always fail (hour-scale gaps).
 
-올바른 실행:
+Correct invocation:
 
 ```bash
-# 터미널 A
+# Terminal A
 ros2 bag play <bag_path> --clock 100
 
-# 터미널 B
-ros2 launch realsense_perception_bringup bringup.launch.py use_sim_time:=true
+# Terminal B
+ros2 launch realsense_perception_bringup bringup.launch.py source:=rosbag
 ```
 
-### 2. RealSense의 sensor-time vs record-time 미스매치
+`source:=rosbag` forces `use_sim_time:=true` for every node in the
+bringup, so you do not need to pass it separately.
 
-`--clock` + `use_sim_time:=true`까지 해도 cloud header.stamp와 `/clock`
-사이에 **수 초 단위 일정한 갭**이 남을 수 있다. 이건 RealSense ROS2
-wrapper가 기본적으로 메시지를 **센서 하드웨어 시간**으로 stamp하기
-때문이다. `--clock`은 bag의 record 시점(시스템 시간) 기준으로 발행되므로
-두 시간이 어긋난다.
+### 2. RealSense sensor-time vs. record-time mismatch
 
-**근본 해결**: bag을 다시 녹화할 때 wrapper에 `use_ros_time:=true` 옵션을 줘서
-시스템 시간으로 stamp되게 한다.
+Even with `--clock` + `use_sim_time:=true`, a **constant offset of a few
+seconds** can remain between the cloud's `header.stamp` and `/clock`. This
+is because the RealSense ROS2 wrapper stamps messages with the
+**sensor hardware clock** by default, while `--clock` publishes the bag's
+record time (system clock). The two clocks are not aligned.
+
+**Root fix**: re-record the bag with `use_ros_time:=true` so the wrapper
+stamps messages in system time:
 ```bash
 ros2 launch realsense2_camera rs_launch.py ... use_ros_time:=true
 ```
 
-**이미 녹화된 bag으로 prototyping할 때**: elevation_mapper의
-`use_latest_tf` 파라미터를 true로 둔다 (기본값). cloud의 stamp 무시하고
-가장 최신 TF로 lookup하므로 갭에 영향받지 않음. 단, estimator가 시간에
-따라 변하는 motion을 발행하기 시작하면 (Madgwick/EKF 등 도입 후)
-부정확해지므로 그 시점엔 false로 바꾼다.
+**Prototyping with an already-recorded bag**: leave the elevation_mapper
+parameter `use_latest_tf` at true (the default). It ignores the cloud's
+`header.stamp` and looks up the latest available TF instead, sidestepping
+the offset. Switch it back to false once a time-varying estimator
+(Madgwick/EKF, ...) is in place, since the latest-TF mode becomes
+inaccurate then.
 
-### 3. TF 트리 분리 확인
+### 3. Check for a disconnected TF tree
 
-bag에는 보통 `camera_link → camera_*_frame` 만 들어 있고, state_estimator는
-`odom → base_link` 만 발행한다. `base_link ↔ camera_link`를 잇는 transform이
-어디에도 없으면 두 트리가 분리된다.
+A bag typically only contains `camera_link → camera_*_frame`, and the
+state_estimator only publishes `odom → base_link`. If nothing connects
+`base_link ↔ camera_link`, the tree is split in two.
 
-확인:
+Check:
 ```bash
-ros2 run tf2_tools view_frames    # 트리 PDF 생성
-# 또는
+ros2 run tf2_tools view_frames    # generates a tree PDF
+# or
 ros2 run tf2_ros tf2_echo base_link camera_link
 ```
 
-연결되어 있지 않으면 데스크탑 데모용으로 위 "TF 주의" 박스의
-static_transform_publisher 한 줄을 추가로 띄운다.
+Launching with `source:=rosbag` already handles this — the bringup
+spawns a `static_transform_publisher` that publishes the
+`base_link → camera_link` transform from
+[`config/camera_mount.json`](realsense_perception_bringup/config/camera_mount.json).
+If the tree is still split (e.g. you used `source:=live` for a bag
+replay), switch to `source:=rosbag`, or edit the JSON / point
+`camera_mount_config:=` at your own file with the correct mount values.
 
 ---
 
-## 향후 기능 추가 가이드
+## Guide for adding future features
 
-### A. 실제 state estimator 추가 (Madgwick / complementary / EKF / VIO)
+### A. Adding a real state estimator (Madgwick / complementary / EKF / VIO)
 
-ROS 노드 코드를 건드리지 않고 클래스 한 개만 추가하는 구조다.
+The structure lets you add a single class without touching the ROS node code.
 
-1. `realsense_state_estimator/realsense_state_estimator/estimators/<name>.py`를 만들고
-   [`StateEstimatorBase`](realsense_state_estimator/realsense_state_estimator/estimators/base.py)를 상속:
+1. Create `realsense_state_estimator/realsense_state_estimator/estimators/<name>.py`
+   inheriting from
+   [`StateEstimatorBase`](realsense_state_estimator/realsense_state_estimator/estimators/base.py):
    ```python
    class MadgwickEstimator(StateEstimatorBase):
        def __init__(self, beta: float = 0.1):
@@ -295,116 +335,161 @@ ROS 노드 코드를 건드리지 않고 클래스 한 개만 추가하는 구�
        def get_pose(self) -> Pose: ...
        def get_twist(self) -> Twist: ...
    ```
-2. [`estimators/__init__.py`](realsense_state_estimator/realsense_state_estimator/estimators/__init__.py)에 export 추가.
-3. [`state_estimator_node.py`](realsense_state_estimator/realsense_state_estimator/state_estimator_node.py)의
-   `_make_estimator`에 한 줄:
+2. Export it from
+   [`estimators/__init__.py`](realsense_state_estimator/realsense_state_estimator/estimators/__init__.py).
+3. Add a single line to `_make_estimator` in
+   [`state_estimator_node.py`](realsense_state_estimator/realsense_state_estimator/state_estimator_node.py):
    ```python
    if name == 'madgwick':
        return MadgwickEstimator(beta=...)
    ```
-   필요한 추가 파라미터는 `declare_parameter`로 노출하고 `_make_estimator`에 전달.
-4. [`config/params.yaml`](realsense_state_estimator/config/params.yaml)에서 `estimator_type: madgwick` 으로 전환.
-5. 검증: `ros2 topic echo /tf` / `/state_estimator/odometry` 가 합리적으로 변하는지 확인.
+   Expose any extra parameters via `declare_parameter` and pass them into
+   `_make_estimator`.
+4. Switch
+   [`config/params.yaml`](realsense_state_estimator/config/params.yaml) to
+   `estimator_type: madgwick`.
+5. Verify that `ros2 topic echo /tf` / `/state_estimator/odometry` shows
+   sensible values.
 
-Split-mode async 융합이 필요하면 `update_accel` / `update_gyro`를 직접
-override (기본 구현은 NaN으로 채워 `update_imu`에 위임).
+If you need split-mode asynchronous fusion, override `update_accel` /
+`update_gyro` directly (the default implementation forwards to `update_imu`
+with NaN-filled fields).
 
-### B. Elevation mapper 출력 포맷 추가 (`grid_map_msgs`, `OccupancyGrid`, marker 등)
+### B. Adding elevation map output formats (`grid_map_msgs`, `OccupancyGrid`, markers, ...)
 
-현재는 PointCloud2만 발행한다. 다른 포맷 추가는 단계가 작다 (C++).
+PointCloud2 is the only output today. Adding more is a small step (C++).
 
-1. 출력 토픽 이름과 enable 플래그를 [`config/params.yaml`](realsense_elevation_mapper/config/params.yaml)에 추가.
-2. [`src/local_elevation_mapper_node.cpp`](realsense_elevation_mapper/src/local_elevation_mapper_node.cpp)에서:
-   - 멤버 변수에 새 `rclcpp::Publisher<...>::SharedPtr` 추가, 생성자에서 `create_publisher`.
-   - `compute_mean_elevation`이 채운 `height_map` / `count_map`을 새 변환 함수에 넣어 메시지화 후 publish.
-3. 변환 로직은 [`include/realsense_elevation_mapper/elevation_grid.hpp`](realsense_elevation_mapper/include/realsense_elevation_mapper/elevation_grid.hpp) +
-   [`src/elevation_grid.cpp`](realsense_elevation_mapper/src/elevation_grid.cpp)에 helper로 추가
-   (예: `nav_msgs::msg::OccupancyGrid grid_to_occupancy_grid(...)`).
-4. [`package.xml`](realsense_elevation_mapper/package.xml)에 새 메시지 패키지 의존성 (`nav_msgs`, `grid_map_msgs` 등) 추가.
-5. [`CMakeLists.txt`](realsense_elevation_mapper/CMakeLists.txt)의 `ament_target_dependencies` 목록에도 동일하게 추가.
+1. Add the output topic name and an enable flag to
+   [`config/params.yaml`](realsense_elevation_mapper/config/params.yaml).
+2. In
+   [`src/local_elevation_mapper_node.cpp`](realsense_elevation_mapper/src/local_elevation_mapper_node.cpp):
+   - Add a new `rclcpp::Publisher<...>::SharedPtr` member and create it in the constructor.
+   - Feed the `height_map` / `count_map` filled by `compute_mean_elevation`
+     into a new conversion function that produces the new message, then publish.
+3. Declare the conversion helper in
+   [`include/realsense_elevation_mapper/elevation_grid.hpp`](realsense_elevation_mapper/include/realsense_elevation_mapper/elevation_grid.hpp)
+   and implement it in
+   [`src/elevation_grid.cpp`](realsense_elevation_mapper/src/elevation_grid.cpp)
+   (e.g. `nav_msgs::msg::OccupancyGrid grid_to_occupancy_grid(...)`).
+4. Add the new message-package dependency to **both**
+   [`package.xml`](realsense_elevation_mapper/package.xml) (`<depend>...</depend>`)
+   and
+   [`CMakeLists.txt`](realsense_elevation_mapper/CMakeLists.txt)
+   (`find_package(...)` + `ament_target_dependencies(...)`).
 
-### C. Cell 통계 확장 (variance, median, min/max)
+### C. Extending cell statistics (variance, median, min/max)
 
-1. [`src/elevation_grid.cpp`](realsense_elevation_mapper/src/elevation_grid.cpp)에 `compute_*_elevation` 함수를 형제로 추가, 헤더에도 선언.
-2. 노드에서 어떤 estimator를 쓸지 파라미터로 분기 (`elevation_estimator: mean | median | ...`).
-3. 단위 테스트: `elevation_grid` 모듈은 ROS 의존성이 없으므로 GoogleTest 같은 C++ 단위 테스트를 별도 `test/` 디렉터리에 둘 수 있다 (현재는 미작성).
+1. Add `compute_*_elevation` sibling functions to
+   [`include/realsense_elevation_mapper/elevation_grid.hpp`](realsense_elevation_mapper/include/realsense_elevation_mapper/elevation_grid.hpp)
+   +
+   [`src/elevation_grid.cpp`](realsense_elevation_mapper/src/elevation_grid.cpp).
+2. Branch on the chosen statistic via a parameter
+   (`elevation_estimator: mean | median | ...`).
+3. Unit tests are easy to add: the `elevation_grid` module has no ROS
+   dependency, so a GoogleTest target under `test/` plus `ament_add_gtest`
+   in [`CMakeLists.txt`](realsense_elevation_mapper/CMakeLists.txt) is
+   enough.
 
-### D. 새 패키지 추가 (예: foothold scoring)
+### D. Adding a new package (e.g. foothold scoring)
 
-Sibling 패키지로 추가하는 것이 권장 패턴이다.
+The recommended pattern is to add it as a sibling package. Pick a language
+based on the workload:
 
-1. `realsense_pcd_to_elev_map/<new_pkg>/` 폴더 생성.
-2. `package.xml`, `setup.py`, `setup.cfg`, `resource/<new_pkg>` 작성
-   (기존 두 Python 패키지를 템플릿으로 복사 후 이름만 교체).
-3. 입력은 `/local_elevation_map/points` (또는 추가된 grid_map) 토픽 구독,
-   출력은 marker / 점군 / 토픽 등 자유.
-4. [`bringup.launch.py`](realsense_perception_bringup/launch/bringup.launch.py)에 `IncludeLaunchDescription`으로 추가.
-5. [`bringup/package.xml`](realsense_perception_bringup/package.xml)의 `<exec_depend>`에 패키지명 추가.
-6. RViz config([default.rviz](realsense_perception_bringup/rviz/default.rviz))에 표시 항목 추가.
+- **Python** for light orchestration / IMU-rate / abstract-interface-driven
+  logic — copy `realsense_state_estimator/` as a template, then write
+  `package.xml`, `setup.py`, `setup.cfg`, `resource/<new_pkg>` with names
+  swapped.
+- **C++** for point-cloud / PCL-Eigen-heavy work — copy
+  `realsense_elevation_mapper/` as a template, then write `package.xml`
+  (build_type=`ament_cmake`) and `CMakeLists.txt` with names swapped.
 
-### E. 파라미터 튜닝만 하고 싶을 때
+Then:
 
-코드 변경 없이 yaml 또는 CLI만으로 가능하다.
+1. Create `realsense_pcd_to_elev_map/<new_pkg>/` and fill it from the
+   chosen template.
+2. Subscribe to `/local_elevation_map/points` (or whatever grid_map topic
+   you have added); publish whatever you need — markers, point clouds,
+   custom topics.
+3. Add an `IncludeLaunchDescription` for it in
+   [`bringup.launch.py`](realsense_perception_bringup/launch/bringup.launch.py).
+4. Add the package name to `<exec_depend>` in
+   [`bringup/package.xml`](realsense_perception_bringup/package.xml).
+5. Add a display entry in the RViz config
+   ([default.rviz](realsense_perception_bringup/rviz/default.rviz)).
+
+### E. Pure parameter tuning
+
+No code changes required — yaml or CLI is enough.
 
 ```bash
-# 일회성 (run-time)
+# One-off (runtime override)
 ros2 launch realsense_elevation_mapper local_elevation_mapper.launch.py \
     --ros-args -p resolution:=0.01 -p k_frames:=10
 
-# 영구 변경
-# 해당 패키지의 config/params.yaml 수정 → colcon build (install share에 복사됨)
+# Permanent
+# Edit the package's config/params.yaml, then colcon build (the file is copied into install/share).
 ```
 
-`launch_arg`로 외부 yaml을 통째로 주입하려면:
+To inject an external yaml wholesale via a launch argument:
 
 ```bash
 ros2 launch realsense_perception_bringup bringup.launch.py \
     params_file:=/path/to/custom.yaml
 ```
 
-(현재 bringup은 각 패키지의 default params를 그대로 쓴다. 외부 yaml 주입을
-지원하려면 [`bringup.launch.py`](realsense_perception_bringup/launch/bringup.launch.py)의
-`IncludeLaunchDescription`에 `launch_arguments={'params_file': ...}` 를 추가.)
+(The bringup currently uses each package's default params. To support
+external yaml injection, add `launch_arguments={'params_file': ...}` to the
+`IncludeLaunchDescription` in
+[`bringup.launch.py`](realsense_perception_bringup/launch/bringup.launch.py).)
 
 ---
 
-## 디렉터리 / 파일 컨벤션
+## Directory / file conventions
 
-- 패키지 이름은 `realsense_*` 접두사 유지.
-- ROS 의존이 없는 모듈(C++: `elevation_grid.cpp`, Python: `estimators/base.py` 등)과
-  ROS 노드(`*_node.{cpp,py}`)를 분리. 전자는 단위 테스트 친화적.
-- 파라미터는 모두 yaml에 모으고, 노드는 `declare_parameter` + `get_parameter`로 읽음 (rclcpp/rclpy 공통).
-- 새 estimator / 출력 포맷은 **새 파일을 추가**하고 노드 본체는 한 줄 추가만.
-  노드 본체를 자주 건드리는 패턴이면 인터페이스 설계가 잘못된 것.
-- 언어 선택 원칙: **hot path / PCL-Eigen 친화 영역은 C++** (elevation_mapper),
-  **light orchestration / abstract 인터페이스는 Python** (state_estimator). 새 패키지를
-  추가할 때도 이 기준으로 결정.
+- Package names keep the `realsense_*` prefix.
+- Separate ROS-independent code (C++: `elevation_grid.cpp` /
+  `pointcloud_utils.cpp`; Python: `estimators/base.py`, `imu_utils.py`)
+  from ROS node code (`*_node.cpp` / `*_node.py`). The former is
+  unit-test friendly.
+- Language-by-package rule of thumb: **C++** for hot paths and
+  PCL/Eigen-heavy work (currently `realsense_elevation_mapper`),
+  **Python** for orchestration and abstract-interface-driven logic
+  (currently `realsense_state_estimator`; launch-only packages like
+  `realsense_perception_bringup` use `ament_cmake` for install rules only).
+  Apply the same rule when adding new packages.
+- Every parameter lives in yaml; nodes load them via
+  `declare_parameter` + `get_parameter` (same API in rclcpp and rclpy).
+- When adding a new estimator / output format, **add a new file** and limit
+  the node body change to a single line. If you find yourself frequently
+  editing the node body, the interface design is wrong.
 
 ---
 
-## 개발 워크플로
+## Development workflow
 
 ```bash
-# 코드 변경 후
-colcon build --packages-select <변경한 패키지>
+# After a code change
+colcon build --packages-select <changed_package>
 source install/setup.bash
 ros2 launch ...
 ```
 
-스켈레톤(인터페이스)에 변화가 없다면 변경된 패키지만 빌드하면 되므로 빠르다.
+When the interface (skeleton) is unchanged, only the modified packages
+need to be rebuilt — that's fast. When the interface changes, rebuild
+every dependent package as well.
 
-### Python 패키지 빠른 iteration
+C++ rebuild iteration: the first `realsense_elevation_mapper` build is
+slow (~30–60 s, PCL headers); incremental rebuilds of just this package
+are fast.
 
-`--symlink-install` 을 한 번 쓰면 Python 소스 변경 시 재빌드 없이 즉시 반영:
+Python iteration is faster with `--symlink-install` — `.py` files
+modified after build take effect on the next launch with no rebuild:
 
 ```bash
 colcon build --packages-select realsense_state_estimator --symlink-install
-# 이후 .py 파일을 수정해도 다시 빌드할 필요 없음 (launch만 다시 실행)
 ```
 
-### 단위 테스트
-
-ROS 의존성이 없는 Python 모듈은 ROS 없이 직접 실행 가능:
+Pure Python modules can be unit-tested without ROS:
 
 ```bash
 cd realsense_state_estimator
@@ -417,6 +502,7 @@ print(e.get_pose())
 "
 ```
 
-C++ `elevation_grid` 모듈도 ROS 독립적이지만 현재는 단위 테스트가 없다 (필요해지면
-`test/` 디렉터리에 GoogleTest 추가, `CMakeLists.txt` 의 `if(BUILD_TESTING)` 블록에서
-`ament_add_gtest` 호출).
+The C++ `elevation_grid` module is also ROS-independent, but no unit
+tests exist yet. To add some, drop a GoogleTest target under `test/` and
+call `ament_add_gtest` inside the `if(BUILD_TESTING)` block of
+[`CMakeLists.txt`](realsense_elevation_mapper/CMakeLists.txt).
