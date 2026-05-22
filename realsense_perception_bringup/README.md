@@ -39,6 +39,9 @@ ros2 launch realsense_perception_bringup bringup.launch.py rviz:=false
 - TF tree with `odom -> base_link` (identity) published by the state estimator placeholder.
 - `AccumulatedPoints` display: the last k frames of RealSense points in `base_link`.
 - `ElevationCloud` display: one box per occupied grid cell.
+- `ColorImage` display: raw RGB stream from the camera
+  (`/camera/camera/color/image_raw`), shown in a separate dockable panel so
+  you can cross-check the scene visually.
 
 If TF is missing, the state estimator placeholder isn't running; check its
 log output. If both clouds are empty, the RealSense wrapper isn't producing
