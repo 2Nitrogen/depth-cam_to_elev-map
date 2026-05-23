@@ -11,6 +11,12 @@ local_elevation_mapper_node:
     map_length_y: 2.0
     resolution: 0.02
 
+    # ROI bounds (meters, in target_frame). Leave ANY of these commented to
+    # run in inspection mode: ROI crop is disabled and the elevation grid
+    # extent auto-fits to the accumulated cloud each frame, so every valid
+    # depth point shows up in /local_elevation_map/points. Uncomment ALL
+    # six to enable the static ROI crop + fixed grid extent intended for
+    # production.
     # x_min: 0.0
     # x_max: 2.0
     # y_min: -1.0
@@ -20,11 +26,6 @@ local_elevation_mapper_node:
 
     publish_accumulated_cloud: true
     publish_elevation_cloud: true
-
-    # Currently false for ROI-bounds inspection (see the accumulated cloud
-    # in RViz, decide proper x/y/z bounds, then re-enable). Production
-    # should be true.
-    enable_roi_crop: false
 
     min_points_per_cell: 1
     cloud_queue_size: 5

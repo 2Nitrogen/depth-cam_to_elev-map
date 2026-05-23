@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -17,6 +18,31 @@
 namespace realsense_elevation_mapper
 {
 
+// Per-callback data pipeline shapes:
+//
+//   in   : sensor_msgs/PointCloud2     N points, fields x,y,z (float32, m)
+//                                      + rgb (float32 packed), frame =
+//                                      camera_*_optical_frame, NaN allowed.
+//   raw  : pcl::PointCloud<PointXYZ>   M <= N (NaN removed), optical frame.
+//   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (base_link).
+//   crop : same M' <= M, applied only when all six ROI bounds are
+//          provided in YAML (otherwise inspection mode -> no crop).
+//   buf  : deque of up to k_frames clouds; concat -> accumulated of
+//          size sum_i |c_i|.
+//   grid : std::vector<float> height_map, size = size_x * size_y,
+//          row-major with idx = ix * size_y + iy, NaN where count == 0.
+//          std::vector<int>   count_map  (parallel).
+//   out_a: sensor_msgs/PointCloud2 sum_i |c_i| points (x,y,z float32),
+//          frame = target_frame.
+//   out_e: sensor_msgs/PointCloud2 <= size_x * size_y points (one per
+//          occupied cell), (x,y) at cell center, z = per-cell estimate.
+//
+// ROI / grid mode (chosen once at construction):
+//   * roi_set_ == true : ROI crop active, grid_spec_ static from YAML.
+//   * roi_set_ == false: inspection mode, no crop, grid_spec rebuilt
+//                        each frame from the accumulated cloud's actual
+//                        XY extent so that every valid depth point shows
+//                        up in the elevation cloud.
 class LocalElevationMapperNode : public rclcpp::Node
 {
 public:
@@ -32,17 +58,20 @@ private:
   std::string target_frame_;
   int k_frames_{5};
 
-  double x_min_{0.0};
-  double x_max_{2.0};
-  double y_min_{-1.0};
-  double y_max_{1.0};
-  double z_min_{-0.5};
-  double z_max_{1.0};
+  // ROI bounds. NaN sentinel means "not provided in YAML" -> inspection
+  // mode (see class comment).
+  double x_min_{std::numeric_limits<double>::quiet_NaN()};
+  double x_max_{std::numeric_limits<double>::quiet_NaN()};
+  double y_min_{std::numeric_limits<double>::quiet_NaN()};
+  double y_max_{std::numeric_limits<double>::quiet_NaN()};
+  double z_min_{std::numeric_limits<double>::quiet_NaN()};
+  double z_max_{std::numeric_limits<double>::quiet_NaN()};
   double resolution_{0.02};
 
   bool publish_accumulated_cloud_{true};
   bool publish_elevation_cloud_{true};
-  bool enable_roi_crop_{true};
+  // Derived at construction: true iff all six ROI bounds are finite.
+  bool roi_set_{false};
   int min_points_per_cell_{1};
   int cloud_queue_size_{5};
   double tf_timeout_sec_{0.1};

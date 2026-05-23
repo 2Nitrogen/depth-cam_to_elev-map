@@ -1,7 +1,10 @@
 #include "realsense_elevation_mapper/local_elevation_mapper_node.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -35,22 +38,23 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   declare_parameter<double>("map_length_y", 2.0);
 
   resolution_ = declare_parameter<double>("resolution", 0.02);
-  x_min_      = declare_parameter<double>("x_min", 0.0);
-  x_max_      = declare_parameter<double>("x_max", 2.0);
-  y_min_      = declare_parameter<double>("y_min", -1.0);
-  y_max_      = declare_parameter<double>("y_max", 1.0);
-  z_min_      = declare_parameter<double>("z_min", -0.5);
-  z_max_      = declare_parameter<double>("z_max", 1.0);
 
-  // When false, ROI cropping is skipped: every transformed point goes
-  // into the accumulated buffer regardless of x_min/x_max/.. bounds.
-  // Useful during bring-up to inspect the raw scene in RViz and decide
-  // appropriate crop bounds. The elevation grid still uses the configured
-  // map_length / resolution and silently drops points outside it — widen
-  // those if you want a full-coverage elevation cloud too. Re-enable for
-  // production: cropping is what keeps the accumulated buffer small enough
-  // to grid-bin every callback.
-  enable_roi_crop_ = declare_parameter<bool>("enable_roi_crop", true);
+  // ROI bounds: NaN default is a sentinel for "not provided in YAML".
+  // When all six are finite, ROI crop is enabled and the grid extent is
+  // fixed; when ANY is missing, we fall back to inspection mode (no crop,
+  // grid auto-fits to the accumulated cloud's actual XY extent each frame).
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  x_min_ = declare_parameter<double>("x_min", kNaN);
+  x_max_ = declare_parameter<double>("x_max", kNaN);
+  y_min_ = declare_parameter<double>("y_min", kNaN);
+  y_max_ = declare_parameter<double>("y_max", kNaN);
+  z_min_ = declare_parameter<double>("z_min", kNaN);
+  z_max_ = declare_parameter<double>("z_max", kNaN);
+
+  roi_set_ =
+    std::isfinite(x_min_) && std::isfinite(x_max_) &&
+    std::isfinite(y_min_) && std::isfinite(y_max_) &&
+    std::isfinite(z_min_) && std::isfinite(z_max_);
 
   publish_accumulated_cloud_ = declare_parameter<bool>("publish_accumulated_cloud", true);
   publish_elevation_cloud_   = declare_parameter<bool>("publish_elevation_cloud", true);
@@ -64,7 +68,9 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   // (e.g. RealSense sensor hardware time vs bag record time).
   use_latest_tf_ = declare_parameter<bool>("use_latest_tf", true);
 
-  grid_spec_ = make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
+  if (roi_set_) {
+    grid_spec_ = make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
+  }
 
   // --- TF ---
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -81,10 +87,21 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   pub_accum_ = create_publisher<sensor_msgs::msg::PointCloud2>(accumulated_cloud_topic_, 1);
   pub_elev_  = create_publisher<sensor_msgs::msg::PointCloud2>(elevation_cloud_topic_, 1);
 
-  RCLCPP_INFO(get_logger(),
-    "Subscribed to %s -> target_frame=%s grid=%zux%zu@%.3fm k_frames=%d",
-    input_cloud_topic_.c_str(), target_frame_.c_str(),
-    grid_spec_.size_x, grid_spec_.size_y, resolution_, k_frames_);
+  if (roi_set_) {
+    RCLCPP_INFO(get_logger(),
+      "Subscribed to %s -> target_frame=%s grid=%zux%zu@%.3fm k_frames=%d (ROI crop on)",
+      input_cloud_topic_.c_str(), target_frame_.c_str(),
+      grid_spec_.size_x, grid_spec_.size_y, resolution_, k_frames_);
+  } else {
+    RCLCPP_WARN(get_logger(),
+      "Subscribed to %s -> target_frame=%s resolution=%.3fm k_frames=%d. "
+      "INSPECTION MODE: not all of x_min/x_max/y_min/y_max/z_min/z_max are "
+      "set in YAML, so ROI crop is disabled and the elevation grid extent "
+      "auto-fits to the accumulated cloud each frame. Provide all six "
+      "bounds in YAML for production.",
+      input_cloud_topic_.c_str(), target_frame_.c_str(),
+      resolution_, k_frames_);
+  }
 }
 
 void LocalElevationMapperNode::on_cloud(
@@ -142,7 +159,7 @@ void LocalElevationMapperNode::on_cloud(
   auto transformed = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::transformPointCloud(*raw, *transformed, transform_f);
 
-  if (enable_roi_crop_) {
+  if (roi_set_) {
     crop_roi(*transformed,
              static_cast<float>(x_min_), static_cast<float>(x_max_),
              static_cast<float>(y_min_), static_cast<float>(y_max_),
@@ -176,11 +193,36 @@ void LocalElevationMapperNode::on_cloud(
     pub_accum_->publish(std::move(out_msg));
   }
 
-  if (publish_elevation_cloud_) {
+  if (publish_elevation_cloud_ && !accumulated->empty()) {
+    // Pick the grid spec for this frame. In ROI-set mode it's the static
+    // spec built at construction. In inspection mode we auto-fit to the
+    // accumulated cloud's actual XY extent so every valid point lands in
+    // some cell. Adding one resolution to max guards against floating-point
+    // rounding pushing the max-coordinate point one cell past the edge.
+    GridSpec frame_spec;
+    if (roi_set_) {
+      frame_spec = grid_spec_;
+    } else {
+      float min_x = std::numeric_limits<float>::infinity();
+      float max_x = -std::numeric_limits<float>::infinity();
+      float min_y = std::numeric_limits<float>::infinity();
+      float max_y = -std::numeric_limits<float>::infinity();
+      for (const auto & p : accumulated->points) {
+        min_x = std::min(min_x, p.x);
+        max_x = std::max(max_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_y = std::max(max_y, p.y);
+      }
+      frame_spec = make_grid_spec(
+        static_cast<double>(min_x), static_cast<double>(max_x) + resolution_,
+        static_cast<double>(min_y), static_cast<double>(max_y) + resolution_,
+        resolution_);
+    }
+
     std::vector<float> height_map;
     std::vector<int> count_map;
-    compute_mean_elevation(*accumulated, grid_spec_, height_map, count_map);
-    auto elev_pts = grid_to_points(height_map, count_map, grid_spec_, min_points_per_cell_);
+    compute_mean_elevation(*accumulated, frame_spec, height_map, count_map);
+    auto elev_pts = grid_to_points(height_map, count_map, frame_spec, min_points_per_cell_);
 
     sensor_msgs::msg::PointCloud2 out_msg;
     pcl::toROSMsg(*elev_pts, out_msg);
