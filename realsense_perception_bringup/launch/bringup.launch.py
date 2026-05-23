@@ -18,21 +18,17 @@ from launch.actions import (
     OpaqueFunction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
 def _launch_setup(context, *args, **kwargs):
     source = LaunchConfiguration('source').perform(context)
-    use_sim_time_str = LaunchConfiguration('use_sim_time').perform(context)
     rviz_str = LaunchConfiguration('rviz').perform(context)
-    camera_mount_config = LaunchConfiguration('camera_mount_config').perform(context)
 
-    # `choices=` on the LaunchArgument already validates, but be explicit
-    # for the few code paths below that branch on the value.
-    effective_use_sim_time = 'true' if source == 'rosbag' else use_sim_time_str
-    use_sim_time_bool = effective_use_sim_time.lower() == 'true'
+    use_sim_time_bool = (source == 'rosbag')
+    use_sim_time_str = 'true' if use_sim_time_bool else 'false'
 
     mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
     estimator_pkg = FindPackageShare('realsense_state_estimator').perform(context)
@@ -44,14 +40,14 @@ def _launch_setup(context, *args, **kwargs):
         PythonLaunchDescriptionSource(
             f'{estimator_pkg}/launch/state_estimator.launch.py'
         ),
-        launch_arguments={'use_sim_time': effective_use_sim_time}.items(),
+        launch_arguments={'use_sim_time': use_sim_time_str}.items(),
     ))
 
     actions.append(IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             f'{mapper_pkg}/launch/local_elevation_mapper.launch.py'
         ),
-        launch_arguments={'use_sim_time': effective_use_sim_time}.items(),
+        launch_arguments={'use_sim_time': use_sim_time_str}.items(),
     ))
 
     if rviz_str.lower() == 'true':
@@ -65,7 +61,7 @@ def _launch_setup(context, *args, **kwargs):
         ))
 
     if source == 'rosbag':
-        with open(camera_mount_config, 'r') as f:
+        with open(f'{bringup_pkg}/config/camera_mount.json', 'r') as f:
             mount = json.load(f)
         t = mount['translation_m']
         r = mount['rotation_rpy_rad']
@@ -90,8 +86,6 @@ def _launch_setup(context, *args, **kwargs):
 
 
 def generate_launch_description() -> LaunchDescription:
-    bringup_pkg = FindPackageShare('realsense_perception_bringup')
-
     return LaunchDescription([
         DeclareLaunchArgument(
             'source',
@@ -100,31 +94,14 @@ def generate_launch_description() -> LaunchDescription:
             description=(
                 'Data source: "live" for a real RealSense camera, "rosbag" '
                 'for replayed data. When "rosbag", use_sim_time is forced '
-                'to true and a static TF (parent/child from camera_mount_config) '
-                'is published to connect base_link with camera_link.'
+                'to true and a static TF (parent/child from '
+                'config/camera_mount.json) is published to connect '
+                'base_link with camera_link.'
             ),
         ),
         DeclareLaunchArgument(
             'rviz', default_value='true',
             description='Launch RViz with the default perception config.',
-        ),
-        DeclareLaunchArgument(
-            'use_sim_time', default_value='false',
-            description=(
-                'Use /clock instead of system time. Ignored (forced true) '
-                'when source=rosbag.'
-            ),
-        ),
-        DeclareLaunchArgument(
-            'camera_mount_config',
-            default_value=PathJoinSubstitution(
-                [bringup_pkg, 'config', 'camera_mount.json']
-            ),
-            description=(
-                'Path to JSON describing the base_link->camera_link mount '
-                'transform. Used only when source=rosbag (live mode is '
-                'expected to get this TF from URDF / robot_state_publisher).'
-            ),
         ),
         OpaqueFunction(function=_launch_setup),
     ])

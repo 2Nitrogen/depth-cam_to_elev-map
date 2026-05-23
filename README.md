@@ -241,9 +241,8 @@ above. `source:=rosbag` is described below.
 > static TF itself, reading translation / RPY from
 > [`realsense_perception_bringup/config/camera_mount.json`](realsense_perception_bringup/config/camera_mount.json).
 > The shipped defaults are all zeros (identity), which is fine for a
-> desktop demo; edit the file (or override via
-> `camera_mount_config:=/path/to/custom.json`) with the actual mount
-> values for your robot.
+> desktop demo; edit the file with the actual mount values for your
+> robot.
 
 ---
 
@@ -312,8 +311,8 @@ spawns a `static_transform_publisher` that publishes the
 `base_link → camera_link` transform from
 [`config/camera_mount.json`](realsense_perception_bringup/config/camera_mount.json).
 If the tree is still split (e.g. you used `source:=live` for a bag
-replay), switch to `source:=rosbag`, or edit the JSON / point
-`camera_mount_config:=` at your own file with the correct mount values.
+replay), switch to `source:=rosbag`, or edit the JSON with the correct
+mount values.
 
 ---
 
