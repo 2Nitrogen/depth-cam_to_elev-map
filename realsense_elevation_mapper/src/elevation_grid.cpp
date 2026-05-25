@@ -8,6 +8,10 @@
 namespace realsense_elevation_mapper
 {
 
+// ---------------------------------------------------------------------------
+// Grid spec
+// ---------------------------------------------------------------------------
+
 GridSpec make_grid_spec(
   double x_min, double x_max,
   double y_min, double y_max,
@@ -21,6 +25,10 @@ GridSpec make_grid_spec(
   spec.size_y = static_cast<std::size_t>(std::floor((y_max - y_min) / resolution));
   return spec;
 }
+
+// ---------------------------------------------------------------------------
+// Per-point measurement variance R
+// ---------------------------------------------------------------------------
 
 double compute_measurement_variance(
   const pcl::PointXYZ & raw_point,
@@ -40,8 +48,7 @@ double compute_measurement_variance(
     }
 
     if (!std::isfinite(depth) || depth <= 0.0) {
-      // Non-physical depth — fall back to the constant value.
-      v = params.sensor_variance;
+      v = params.sensor_variance;  // non-physical depth → fallback
     } else {
       v = params.sensor_noise_factor * depth * depth;
     }
@@ -55,6 +62,160 @@ double compute_measurement_variance(
                     params.min_measurement_variance,
                     params.max_measurement_variance);
 }
+
+// ---------------------------------------------------------------------------
+// Stage ❶: bin one frame into per-cell aggregates
+// ---------------------------------------------------------------------------
+
+namespace
+{
+struct CellAccum
+{
+  double        sum_z{0.0};
+  double        sum_v{0.0};
+  std::uint32_t n{0};
+};
+}  // namespace
+
+std::vector<CellMeasurement> bin_frame_into_cells(
+  const std::vector<HeightMeasurement> & measurements,
+  const GridSpec & spec)
+{
+  const std::size_t n_cells = spec.size_x * spec.size_y;
+  std::vector<CellMeasurement> out;
+  if (n_cells == 0 || measurements.empty()) {
+    return out;
+  }
+
+  std::vector<CellAccum> accum(n_cells);  // dense, zero-initialised
+  const double inv_res = 1.0 / spec.resolution;
+
+  // O(N) accumulation pass — no function calls in the loop body.
+  for (const auto & m : measurements) {
+    const double dx = (static_cast<double>(m.x) - spec.x_min) * inv_res;
+    const double dy = (static_cast<double>(m.y) - spec.y_min) * inv_res;
+    if (dx < 0.0 || dy < 0.0) {
+      continue;
+    }
+    const std::size_t ix = static_cast<std::size_t>(dx);
+    const std::size_t iy = static_cast<std::size_t>(dy);
+    if (ix >= spec.size_x || iy >= spec.size_y) {
+      continue;
+    }
+    auto & a = accum[ix * spec.size_y + iy];
+    a.sum_z += static_cast<double>(m.z);
+    a.sum_v += m.variance;
+    a.n     += 1;
+  }
+
+  // Pack occupied cells into a sparse output. Output stores world-frame
+  // cell centres so the fusion stage can use a different spec.
+  out.reserve(n_cells / 8);  // heuristic: ~10% occupancy
+  for (std::size_t ix = 0; ix < spec.size_x; ++ix) {
+    const float x_center =
+      static_cast<float>(spec.x_min + (static_cast<double>(ix) + 0.5) * spec.resolution);
+    for (std::size_t iy = 0; iy < spec.size_y; ++iy) {
+      const auto & a = accum[ix * spec.size_y + iy];
+      if (a.n == 0) {
+        continue;
+      }
+      const float  y_center =
+        static_cast<float>(spec.y_min + (static_cast<double>(iy) + 0.5) * spec.resolution);
+      const double inv_n   = 1.0 / static_cast<double>(a.n);
+      out.push_back({
+        x_center,
+        y_center,
+        static_cast<float>(a.sum_z * inv_n),
+        a.sum_v * inv_n,
+        a.n,
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Stage ❸: fuse one binned frame into persistent layers
+// ---------------------------------------------------------------------------
+
+void fuse_binned_frame(
+  const std::vector<CellMeasurement> & cells,
+  double stamp_sec,
+  const GridSpec & spec,
+  const FusionParams & params,
+  MapLayers & layers)
+{
+  if (cells.empty() || layers.height_map.empty()) {
+    return;
+  }
+
+  // Hoist params out of the loop so the inner body is plain arithmetic.
+  const double v_min_meas = params.min_measurement_variance;
+  const double v_max_meas = params.max_measurement_variance;
+  const double v_min_map  = params.min_variance;
+  const double v_max_map  = params.max_variance;
+  const double m_thresh   = params.mahalanobis_threshold;
+  const bool   use_R_gate = params.mahalanobis_use_measurement_variance;
+  const double v_bump     = params.multi_height_noise;
+  const double inv_res    = 1.0 / spec.resolution;
+
+  for (const auto & c : cells) {
+    // Locate this cell-measurement in the *current* spec. We stored world
+    // coordinates at bin time, so this works even if spec drifted since.
+    const double dx = (static_cast<double>(c.x) - spec.x_min) * inv_res;
+    const double dy = (static_cast<double>(c.y) - spec.y_min) * inv_res;
+    if (dx < 0.0 || dy < 0.0) {
+      continue;
+    }
+    const std::size_t ix = static_cast<std::size_t>(dx);
+    const std::size_t iy = static_cast<std::size_t>(dy);
+    if (ix >= spec.size_x || iy >= spec.size_y) {
+      continue;
+    }
+    const std::size_t idx = ix * spec.size_y + iy;
+
+    const double z_meas = static_cast<double>(c.z);
+    const double v_meas = std::clamp(c.variance, v_min_meas, v_max_meas);
+
+    if (layers.count_map[idx] == 0) {
+      // First measurement to hit this cell.
+      layers.height_map[idx]    = static_cast<float>(z_meas);
+      layers.variance_map[idx]  = static_cast<float>(
+        std::clamp(v_meas, v_min_map, v_max_map));
+      layers.timestamp_map[idx] = stamp_sec;
+      layers.count_map[idx]     = 1;
+      continue;
+    }
+
+    const double z_curr   = layers.height_map[idx];
+    const double v_curr   = layers.variance_map[idx];
+    const double gate_v   = use_R_gate ? (v_curr + v_meas) : v_curr;
+    const double safe_gate = std::max(gate_v, v_min_map);
+    const double maha     = std::abs(z_meas - z_curr) / std::sqrt(safe_gate);
+
+    if (maha <= m_thresh) {
+      // Standard 1D Kalman fusion.
+      const double v_sum = v_curr + v_meas;
+      const double v_new = (v_curr * v_meas) / v_sum;
+      const double z_new = (v_curr * z_meas + v_meas * z_curr) / v_sum;
+      layers.height_map[idx]   = static_cast<float>(z_new);
+      layers.variance_map[idx] = static_cast<float>(
+        std::clamp(v_new, v_min_map, v_max_map));
+    } else {
+      // Outlier: bump P to admit future correction, keep z (cupy-style).
+      const double v_bumped = v_curr + v_bump;
+      layers.variance_map[idx] = static_cast<float>(
+        std::clamp(v_bumped, v_min_map, v_max_map));
+    }
+
+    layers.timestamp_map[idx] = stamp_sec;
+    layers.count_map[idx]    += 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Layer lifecycle
+// ---------------------------------------------------------------------------
 
 void reset_layers(const GridSpec & spec, MapLayers & layers)
 {
@@ -89,114 +250,6 @@ void prune_stale_cells(MapLayers & layers, double now_sec, double max_age_sec)
       layers.timestamp_map[i] = dnan;
       layers.count_map[i]     = 0;
     }
-  }
-}
-
-bool fuse_measurement_into_cell(
-  const HeightMeasurement & m,
-  double stamp_sec,
-  const GridSpec & spec,
-  const FusionParams & params,
-  MapLayers & layers)
-{
-  const double dx = (static_cast<double>(m.x) - spec.x_min) / spec.resolution;
-  const double dy = (static_cast<double>(m.y) - spec.y_min) / spec.resolution;
-  if (dx < 0.0 || dy < 0.0) {
-    return false;
-  }
-  const std::size_t ix = static_cast<std::size_t>(dx);
-  const std::size_t iy = static_cast<std::size_t>(dy);
-  if (ix >= spec.size_x || iy >= spec.size_y) {
-    return false;
-  }
-  const std::size_t idx = ix * spec.size_y + iy;
-
-  // Defensive re-clamp of R. compute_measurement_variance() should have
-  // already done this, but a stale-buffered measurement crossing a YAML
-  // bound change could be out of range.
-  const double v_meas = std::clamp(m.variance,
-                                   params.min_measurement_variance,
-                                   params.max_measurement_variance);
-  const double z_meas = static_cast<double>(m.z);
-
-  if (layers.count_map[idx] == 0) {
-    // First measurement in this cell: store R clamped to the *map estimate*
-    // range so the posterior variance never starts outside P's range.
-    layers.height_map[idx]    = static_cast<float>(z_meas);
-    layers.variance_map[idx]  = static_cast<float>(
-      std::clamp(v_meas, params.min_variance, params.max_variance));
-    layers.timestamp_map[idx] = stamp_sec;
-    layers.count_map[idx]     = 1;
-    return true;
-  }
-
-  const double z_curr = static_cast<double>(layers.height_map[idx]);
-  const double v_curr = static_cast<double>(layers.variance_map[idx]);
-
-  // Mahalanobis gate. With innovation variance (P + R) the test is
-  // statistically standard; without (legacy mode, just P) it gives a
-  // tighter gate that matches the prior fixed-variance behavior.
-  const double gate_variance =
-    params.mahalanobis_use_measurement_variance ? (v_curr + v_meas) : v_curr;
-  const double safe_gate_variance =
-    std::max(gate_variance, params.min_variance);
-  const double mahalanobis =
-    std::abs(z_meas - z_curr) / std::sqrt(safe_gate_variance);
-
-  if (mahalanobis <= params.mahalanobis_threshold) {
-    // 1D Kalman fusion.
-    const double v_sum = v_curr + v_meas;
-    const double v_new = (v_curr * v_meas) / v_sum;
-    const double z_new = (v_curr * z_meas + v_meas * z_curr) / v_sum;
-    layers.height_map[idx]   = static_cast<float>(z_new);
-    layers.variance_map[idx] = static_cast<float>(
-      std::clamp(v_new, params.min_variance, params.max_variance));
-  } else {
-    // Multi-height / outlier policy.
-    const double age = stamp_sec - layers.timestamp_map[idx];
-    const bool fresh = age >= 0.0 && age <= params.scanning_duration_sec;
-    if (fresh && z_meas < z_curr) {
-      // Lower point in the same scan window: likely transient occluder
-      // (e.g. dynamic object). Keep the existing higher surface. The
-      // timestamp/count updates at the bottom still apply: this consumed
-      // a measurement, and refreshing the scan window keeps subsequent
-      // same-scan low points classified as "same scan".
-    } else if (fresh && z_meas > z_curr) {
-      // Higher point in the same scan window: surface raised (new
-      // obstacle on top). Reseed value + variance from this measurement.
-      // count is intentionally not reset here so it keeps reflecting how
-      // many measurements have hit this XY cell (cumulative observation
-      // count rather than "samples since last reseed"); same convention
-      // as MonKey-Robotics / ANYbotics.
-      layers.height_map[idx]   = static_cast<float>(z_meas);
-      layers.variance_map[idx] = static_cast<float>(
-        std::clamp(v_meas, params.min_variance, params.max_variance));
-    } else {
-      // Different scan window: bump variance to admit future correction.
-      const double v_bumped = v_curr + params.multi_height_noise;
-      layers.variance_map[idx] = static_cast<float>(
-        std::clamp(v_bumped, params.min_variance, params.max_variance));
-    }
-  }
-
-  // Always refresh timestamp/count once any measurement landed in this
-  // cell. Even ignored / variance-bumped measurements count as
-  // "observed", and the timestamp drives the same-scan-window logic
-  // above as well as prune_stale_cells's staleness gate.
-  layers.timestamp_map[idx] = stamp_sec;
-  layers.count_map[idx]    += 1;
-  return true;
-}
-
-void fuse_measurements(
-  const std::vector<HeightMeasurement> & measurements,
-  double stamp_sec,
-  const GridSpec & spec,
-  const FusionParams & params,
-  MapLayers & layers)
-{
-  for (const auto & m : measurements) {
-    fuse_measurement_into_cell(m, stamp_sec, spec, params, layers);
   }
 }
 

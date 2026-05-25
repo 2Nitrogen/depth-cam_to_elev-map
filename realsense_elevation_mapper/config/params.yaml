@@ -35,6 +35,9 @@ local_elevation_mapper_node:
     publish_accumulated_cloud: true
     publish_elevation_cloud: true
 
+    # Cells with fewer than this many *temporal* updates are dropped from
+    # the published elevation cloud. Each update corresponds to one
+    # buffered frame contributing this cell.
     min_points_per_cell: 1
     cloud_queue_size: 5
     tf_timeout_sec: 0.1
@@ -46,6 +49,10 @@ local_elevation_mapper_node:
 
     # --- Per-cell Kalman fusion ---
     # See FusionParams in elevation_grid.hpp. Variances are in m^2.
+    # Fusion is always per-frame per-cell: each incoming frame is binned
+    # into one CellMeasurement per occupied cell (mean z, mean R of the
+    # raw points in that cell), then each buffered frame contributes at
+    # most one Kalman update per cell during temporal fusion.
 
     # Per-point measurement variance R model.
     #   constant      : R = sensor_variance (legacy behavior — every
@@ -85,9 +92,8 @@ local_elevation_mapper_node:
     min_variance: 0.000009           # (3 mm)^2 — floor; keeps cells correctable
     max_variance: 0.01               # (10 cm)^2 — ceiling / sanity rail
 
-    mahalanobis_threshold: 2.5       # multi-height gate (sigma)
-    multi_height_noise: 0.0000009    # variance bump for older outliers
-    scanning_duration_sec: 0.5       # ~ k_frames * frame_dt
+    mahalanobis_threshold: 2.5       # outlier gate (sigma units)
+    multi_height_noise: 0.0000009    # variance bump on outlier rejection
 
     # Continuous cleanup: rebuild the grid every callback so the map only
     # reflects the current accumulated buffer. Right default while the

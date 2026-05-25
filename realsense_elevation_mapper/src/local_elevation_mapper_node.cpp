@@ -125,12 +125,10 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   fusion_params_.max_variance          = declare_parameter<double>("max_variance", 0.01);
   fusion_params_.mahalanobis_threshold = declare_parameter<double>("mahalanobis_threshold", 2.5);
   fusion_params_.multi_height_noise    = declare_parameter<double>("multi_height_noise", 0.0000009);
-  fusion_params_.scanning_duration_sec = declare_parameter<double>("scanning_duration_sec", 0.5);
   enable_continuous_cleanup_           = declare_parameter<bool>("enable_continuous_cleanup", true);
   max_age_sec_                         = declare_parameter<double>("max_age_sec", 2.0);
 
   // --- Per-point measurement variance R (see FusionParams docs) ---
-  // Defaults keep legacy behavior: every point gets R = sensor_variance.
   const std::string mv_model_name =
     declare_parameter<std::string>("measurement_variance_model", "constant");
   const std::string depth_source_name =
@@ -149,10 +147,6 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   fusion_params_.measurement_variance_model = parse_mv_model(mv_model_name);
   fusion_params_.depth_source = parse_depth_source(depth_source_name);
 
-  if (roi_set_) {
-    grid_spec_ = make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
-  }
-
   // --- TF ---
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -169,10 +163,15 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   pub_elev_  = create_publisher<sensor_msgs::msg::PointCloud2>(elevation_cloud_topic_, 1);
 
   if (roi_set_) {
+    // Compute the initial grid spec just for the startup log. The runtime
+    // fusion path builds its own frame_spec per callback (track-point
+    // shifted in motion mode).
+    const auto initial_spec =
+      make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
     RCLCPP_INFO(get_logger(),
       "Subscribed to %s -> target_frame=%s grid=%zux%zu@%.3fm k_frames=%d (ROI crop on)",
       input_cloud_topic_.c_str(), target_frame_.c_str(),
-      grid_spec_.size_x, grid_spec_.size_y, resolution_, k_frames_);
+      initial_spec.size_x, initial_spec.size_y, resolution_, k_frames_);
   } else {
     RCLCPP_WARN(get_logger(),
       "Subscribed to %s -> target_frame=%s resolution=%.3fm k_frames=%d. "
@@ -186,8 +185,7 @@ LocalElevationMapperNode::LocalElevationMapperNode()
 
   RCLCPP_INFO(get_logger(),
     "Measurement variance model: %s, depth source: %s, sensor_variance=%.6g, "
-    "sensor_noise_factor=%.6g, R clamp=[%.6g, %.6g], "
-    "mahalanobis_use_R=%s",
+    "sensor_noise_factor=%.6g, R clamp=[%.6g, %.6g], mahalanobis_use_R=%s",
     mv_model_str(fusion_params_.measurement_variance_model),
     depth_source_str(fusion_params_.depth_source),
     fusion_params_.sensor_variance,
@@ -271,11 +269,13 @@ void LocalElevationMapperNode::on_cloud(
     }
   }
 
-  // Build a HeightMeasurement per surviving point. raw[i] feeds R; the
-  // matching transformed[i] gives the target-frame (x, y, z) used for
-  // cell binning and the Kalman update on height. removeNaN was done
-  // in-place on raw, then transformPointCloud preserves ordering, so the
-  // indices line up.
+  // ---------------------------------------------------------------------
+  // Build per-point HeightMeasurements.
+  //   raw[i] feeds R = compute_measurement_variance(...).
+  //   transformed[i] gives target-frame xyz used for cell binning + fusion.
+  //   removeNaN was done in-place on raw, then transformPointCloud preserves
+  //   ordering, so raw[i] / transformed[i] always correspond.
+  // ---------------------------------------------------------------------
   std::vector<HeightMeasurement> measurements;
   measurements.reserve(transformed->size());
   for (std::size_t i = 0; i < transformed->size(); ++i) {
@@ -294,30 +294,75 @@ void LocalElevationMapperNode::on_cloud(
       static_cast<float>(z_min_),        static_cast<float>(z_max_));
   }
 
-  measurement_buffer_.push_back(std::move(measurements));
+  // ---------------------------------------------------------------------
+  // Pick this frame's grid spec.
+  //   ROI mode      : configured bounds shifted by the track-point
+  //                   translation (ego-centric in motion mode, identical
+  //                   to configured bounds when translation = 0).
+  //   Inspection    : auto-fit to this frame's measurement extent so every
+  //                   valid point lands in some cell.
+  // The bin stage uses this spec. The fusion stage will use a freshly
+  // computed spec too — CellMeasurement stores world-frame cell centres,
+  // so the two specs do not need to match (matters in inspection mode
+  // where the auto-fit can drift frame to frame).
+  // ---------------------------------------------------------------------
+  GridSpec frame_spec;
+  if (roi_set_) {
+    frame_spec = make_grid_spec(
+      x_min_ + tp_dx, x_max_ + tp_dx,
+      y_min_ + tp_dy, y_max_ + tp_dy,
+      resolution_);
+  } else if (!measurements.empty()) {
+    float min_x = std::numeric_limits<float>::infinity();
+    float max_x = -std::numeric_limits<float>::infinity();
+    float min_y = std::numeric_limits<float>::infinity();
+    float max_y = -std::numeric_limits<float>::infinity();
+    for (const auto & m : measurements) {
+      min_x = std::min(min_x, m.x);
+      max_x = std::max(max_x, m.x);
+      min_y = std::min(min_y, m.y);
+      max_y = std::max(max_y, m.y);
+    }
+    frame_spec = make_grid_spec(
+      static_cast<double>(min_x), static_cast<double>(max_x) + resolution_,
+      static_cast<double>(min_y), static_cast<double>(max_y) + resolution_,
+      resolution_);
+  }
+
+  // ---------------------------------------------------------------------
+  // ❶ Bin this frame: raw measurements -> per-cell aggregates.
+  //   Within-cell averaging finishes here in one O(N) pass: a cell that
+  //   collected several raw points emerges as a single CellMeasurement
+  //   carrying mean(z), mean(R), and the raw-point count.
+  // ---------------------------------------------------------------------
+  std::vector<CellMeasurement> binned_cells =
+    bin_frame_into_cells(measurements, frame_spec);
+
+  // ---------------------------------------------------------------------
+  // ❷ Accumulate: push this frame's binned cells into the k_frames window.
+  //   The buffer holds *cell-level* representations, not raw points. Memory
+  //   stays proportional to occupied cells * k_frames, not point count *
+  //   k_frames.
+  // ---------------------------------------------------------------------
+  measurement_buffer_.push_back({out_stamp.seconds(), std::move(binned_cells)});
   while (static_cast<int>(measurement_buffer_.size()) > k_frames_) {
     measurement_buffer_.pop_front();
   }
 
-  // Concatenate buffered measurement vectors for both downstream outputs.
-  std::vector<HeightMeasurement> accumulated;
-  std::size_t total = 0;
-  for (const auto & f : measurement_buffer_) {
-    total += f.size();
-  }
-  accumulated.reserve(total);
-  for (const auto & f : measurement_buffer_) {
-    accumulated.insert(accumulated.end(), f.begin(), f.end());
-  }
-
+  // accumulated_points debug topic: cell-centre cloud of everything in the
+  // window. One point per (frame, cell) pair (so the same physical cell
+  // can produce up to k_frames points across the deque).
   if (publish_accumulated_cloud_) {
-    // Rebuild a PointXYZ cloud (variance dropped) for the debug topic.
     pcl::PointCloud<pcl::PointXYZ> accum_cloud;
-    accum_cloud.points.reserve(accumulated.size());
-    for (const auto & m : accumulated) {
-      pcl::PointXYZ p;
-      p.x = m.x; p.y = m.y; p.z = m.z;
-      accum_cloud.points.push_back(p);
+    std::size_t total = 0;
+    for (const auto & f : measurement_buffer_) total += f.cells.size();
+    accum_cloud.points.reserve(total);
+    for (const auto & f : measurement_buffer_) {
+      for (const auto & c : f.cells) {
+        pcl::PointXYZ p;
+        p.x = c.x; p.y = c.y; p.z = c.z;
+        accum_cloud.points.push_back(p);
+      }
     }
     accum_cloud.width = static_cast<std::uint32_t>(accum_cloud.points.size());
     accum_cloud.height = 1;
@@ -329,43 +374,20 @@ void LocalElevationMapperNode::on_cloud(
     pub_accum_->publish(std::move(out_msg));
   }
 
-  if (publish_elevation_cloud_ && !accumulated.empty()) {
-    // Pick the grid spec for this frame. In ROI-set mode the bounds follow
-    // the track point (configured bounds shifted by the target -> track
-    // point translation). In inspection mode we auto-fit to the accumulated
-    // cloud's actual XY extent so every valid point lands in some cell.
-    // Adding one resolution to max guards against floating-point rounding
-    // pushing the max-coordinate point one cell past the edge.
-    GridSpec frame_spec;
-    if (roi_set_) {
-      frame_spec = make_grid_spec(
-        x_min_ + tp_dx, x_max_ + tp_dx,
-        y_min_ + tp_dy, y_max_ + tp_dy,
-        resolution_);
-    } else {
-      float min_x = std::numeric_limits<float>::infinity();
-      float max_x = -std::numeric_limits<float>::infinity();
-      float min_y = std::numeric_limits<float>::infinity();
-      float max_y = -std::numeric_limits<float>::infinity();
-      for (const auto & m : accumulated) {
-        min_x = std::min(min_x, m.x);
-        max_x = std::max(max_x, m.x);
-        min_y = std::min(min_y, m.y);
-        max_y = std::max(max_y, m.y);
-      }
-      frame_spec = make_grid_spec(
-        static_cast<double>(min_x), static_cast<double>(max_x) + resolution_,
-        static_cast<double>(min_y), static_cast<double>(max_y) + resolution_,
-        resolution_);
-    }
-
+  // ---------------------------------------------------------------------
+  // ❸ Fuse: temporal Kalman update of every buffered frame into layers_.
+  //   continuous_cleanup=true (default for stationary use) wipes the
+  //   layers at the start of each callback, so a 5-frame buffer means up
+  //   to 5 sequential Kalman updates per cell — true temporal fusion.
+  //
+  //   Skip the whole stage when frame_spec is degenerate (size 0). That
+  //   happens only in inspection mode + completely empty measurements;
+  //   acting on a zero-size spec would silently wipe a persistent map
+  //   (non-continuous_cleanup) via the shape_changed branch.
+  // ---------------------------------------------------------------------
+  if (publish_elevation_cloud_ && !measurement_buffer_.empty() &&
+      frame_spec.size_x > 0 && frame_spec.size_y > 0) {
     const double stamp_sec = out_stamp.seconds();
-
-    // Continuous cleanup mode (default for the stationary case): start with
-    // a fresh grid every callback so the map mirrors the current
-    // accumulated buffer only. Otherwise reuse the persistent grid; if its
-    // shape changed we still have to resize, and stale cells are aged out
-    // by max_age_sec.
     const bool shape_changed =
       layers_.height_map.size() != frame_spec.size_x * frame_spec.size_y;
     if (enable_continuous_cleanup_ || shape_changed) {
@@ -374,21 +396,29 @@ void LocalElevationMapperNode::on_cloud(
       prune_stale_cells(layers_, stamp_sec, max_age_sec_);
     }
 
-    fuse_measurements(accumulated, stamp_sec, frame_spec, fusion_params_, layers_);
+    for (const auto & f : measurement_buffer_) {
+      fuse_binned_frame(f.cells, f.stamp_sec, frame_spec, fusion_params_, layers_);
+    }
 
     if (debug_measurement_variance_) {
       double min_v = std::numeric_limits<double>::infinity();
       double max_v = -std::numeric_limits<double>::infinity();
       double sum_v = 0.0;
-      for (const auto & m : accumulated) {
-        if (m.variance < min_v) min_v = m.variance;
-        if (m.variance > max_v) max_v = m.variance;
-        sum_v += m.variance;
+      std::size_t total = 0;
+      for (const auto & f : measurement_buffer_) {
+        for (const auto & c : f.cells) {
+          if (c.variance < min_v) min_v = c.variance;
+          if (c.variance > max_v) max_v = c.variance;
+          sum_v += c.variance;
+          ++total;
+        }
       }
-      const double mean_v = sum_v / static_cast<double>(accumulated.size());
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "Measurement variance stats: min=%.6g, mean=%.6g, max=%.6g, count=%zu",
-        min_v, mean_v, max_v, accumulated.size());
+      if (total > 0) {
+        const double mean_v = sum_v / static_cast<double>(total);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+          "Cell-measurement variance stats: min=%.6g, mean=%.6g, max=%.6g, cells=%zu",
+          min_v, mean_v, max_v, total);
+      }
     }
 
     auto elev_pts = grid_to_xyzi_points(frame_spec, layers_, min_points_per_cell_);

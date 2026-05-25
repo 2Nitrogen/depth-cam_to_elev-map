@@ -18,36 +18,36 @@
 namespace realsense_elevation_mapper
 {
 
-// Per-callback data pipeline shapes:
+// Per-callback data pipeline (three explicit stages):
 //
 //   in   : sensor_msgs/PointCloud2     N points, fields x,y,z (float32, m)
 //                                      + rgb (float32 packed), frame =
 //                                      camera_*_optical_frame, NaN allowed.
 //   raw  : pcl::PointCloud<PointXYZ>   M <= N (NaN removed), optical frame.
-//                                      Kept around to compute per-point
-//                                      measurement variance from the
+//                                      Kept to compute per-point R from
 //                                      raw-frame depth.
 //   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (default odom,
 //                                      gravity-aligned per REP-103). Same
-//                                      ordering as raw, so raw[i] and
-//                                      transformed[i] always correspond.
-//   meas : std::vector<HeightMeasurement>  M, each entry bundles
-//                                      (target.x, target.y, target.z,
-//                                       R = compute_measurement_variance(raw[i])).
-//                                      From here on raw is unused; the
-//                                      pipeline operates on measurements
-//                                      so x/y/z and R never desynchronize.
+//                                      ordering as raw — index pairs line up.
+//   meas : std::vector<HeightMeasurement>  M, bundles target-frame (x,y,z)
+//                                      with R = compute_measurement_variance(raw[i]).
 //   crop : same M' <= M, applied only when all six ROI bounds are
 //          provided in YAML (otherwise inspection mode -> no crop).
-//   buf  : deque of up to k_frames measurement vectors; concat -> accumulated
-//          of size sum_i |m_i|.
-//   grid : std::vector<float> height_map, size = size_x * size_y,
-//          row-major with idx = ix * size_y + iy, NaN where count == 0.
-//          std::vector<int>   count_map  (parallel).
-//   out_a: sensor_msgs/PointCloud2 sum_i |m_i| points (x,y,z float32, rebuilt
-//          from accumulated measurements), frame = target_frame.
+//
+//   ❶ bin   : std::vector<CellMeasurement>  K <= M', one entry per occupied
+//             cell in the frame. (x_center, y_center) world coords + mean z
+//             + mean R + raw point count. Implemented by
+//             bin_frame_into_cells() — within-cell aggregation finishes here.
+//   ❷ accum : deque<BinnedFrame> measurement_buffer_, the last k_frames
+//             of bin results. Sliding window. Raw points are not kept.
+//   ❸ fuse  : for each buffered frame, fuse_binned_frame() walks the cells
+//             and performs exactly one Mahalanobis-gated Kalman update per
+//             cell against the current MapLayers (cell-to-cell pairing).
+//
+//   out_a: sensor_msgs/PointCloud2 cell-centre representation of the
+//          accumulated buffer (sum over frames of |cells|), frame = target_frame.
 //   out_e: sensor_msgs/PointCloud2 <= size_x * size_y points (one per
-//          occupied cell), (x,y) at cell center, z = per-cell estimate,
+//          occupied cell), (x,y) at cell centre, z = per-cell estimate,
 //          intensity = sqrt(map estimate variance P).
 //
 // Frame semantics:
@@ -119,14 +119,15 @@ private:
   bool enable_continuous_cleanup_{true};
   double max_age_sec_{2.0};
 
-  // derived state
-  GridSpec grid_spec_;
+  // derived state. The grid spec itself is *not* a member — on_cloud
+  // computes a fresh frame_spec each callback (so it can shift with the
+  // track point in ROI mode or auto-fit in inspection mode).
   MapLayers layers_;
-  // Last k_frames worth of measurements (target-frame xyz + per-point R).
-  // deque-of-vector keeps each point's variance bundled with its xyz so
-  // ROI cropping, concatenation, and frame-by-frame eviction never
-  // desynchronize the parallel data.
-  std::deque<std::vector<HeightMeasurement>> measurement_buffer_;
+  // Last k_frames worth of *binned* frames (per-cell aggregates, not raw
+  // points). One BinnedFrame per arrival. CellMeasurement stores world-frame
+  // cell-centre coords so the fusion grid spec is free to differ from the
+  // bin spec (matters when inspection mode auto-fits each callback).
+  std::deque<BinnedFrame> measurement_buffer_;
 
   // TF
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
