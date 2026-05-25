@@ -27,4 +27,23 @@ void crop_roi(
   cloud = std::move(filtered);
 }
 
+void crop_measurements_roi(
+  std::vector<HeightMeasurement> & measurements,
+  float x_min, float x_max,
+  float y_min, float y_max,
+  float z_min, float z_max)
+{
+  std::vector<HeightMeasurement> filtered;
+  filtered.reserve(measurements.size());
+  for (const auto & m : measurements) {
+    if (m.x >= x_min && m.x < x_max &&
+        m.y >= y_min && m.y < y_max &&
+        m.z >= z_min && m.z < z_max)
+    {
+      filtered.push_back(m);
+    }
+  }
+  measurements = std::move(filtered);
+}
+
 }  // namespace realsense_elevation_mapper

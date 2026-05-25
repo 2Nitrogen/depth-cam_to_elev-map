@@ -46,9 +46,45 @@ local_elevation_mapper_node:
 
     # --- Per-cell Kalman fusion ---
     # See FusionParams in elevation_grid.hpp. Variances are in m^2.
-    sensor_variance: 0.0009          # (3 cm)^2 — constant measurement noise for v1
+
+    # Per-point measurement variance R model.
+    #   constant      : R = sensor_variance (legacy behavior — every
+    #                   point gets the same measurement variance).
+    #   depth_squared : R = sensor_noise_factor * depth^2 (R grows
+    #                   with range, more weight to near-camera points).
+    measurement_variance_model: depth_squared
+
+    # Only used when measurement_variance_model = depth_squared.
+    #   raw_z      : depth = raw sensor-frame point.z (RealSense optical
+    #                convention — z is the optical depth axis).
+    #   range_norm : depth = sqrt(x^2 + y^2 + z^2) in raw sensor frame.
+    depth_source: raw_z
+
+    sensor_variance: 0.0009          # (3 cm)^2 — constant R, also fallback for bad depth
+    sensor_noise_factor: 0.0009      # depth_squared coefficient; at depth=1m gives R=0.0009 (sigma=3cm)
+
+    # Clamp applied to measurement variance R BEFORE each Kalman update.
+    # Distinct from min_variance / max_variance below, which clamp the
+    # map estimate variance P. Keep min < max.
+    min_measurement_variance: 0.000009
+    max_measurement_variance: 0.01
+
+    # If true, the Mahalanobis gate uses innovation variance (P + R).
+    # If false, only P is used in the denominator (legacy behavior when
+    # R was constant).
+    # With depth_squared mode active, true is the consistent choice:
+    # far-range measurements have large R and a P-only gate would reject
+    # them too aggressively.
+    mahalanobis_use_measurement_variance: true
+
+    # If true, log per-callback min/mean/max of the per-point measurement
+    # variance over the accumulated buffer (throttled to ~1 Hz).
+    debug_measurement_variance: false
+
+    # Map estimate variance P clamp (applied after every fusion step).
     min_variance: 0.000009           # (3 mm)^2 — floor; keeps cells correctable
     max_variance: 0.01               # (10 cm)^2 — ceiling / sanity rail
+
     mahalanobis_threshold: 2.5       # multi-height gate (sigma)
     multi_height_noise: 0.0000009    # variance bump for older outliers
     scanning_duration_sec: 0.5       # ~ k_frames * frame_dt

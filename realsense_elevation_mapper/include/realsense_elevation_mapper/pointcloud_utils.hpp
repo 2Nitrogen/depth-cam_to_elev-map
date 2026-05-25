@@ -1,7 +1,11 @@
 #pragma once
 
+#include <vector>
+
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+
+#include "realsense_elevation_mapper/elevation_grid.hpp"
 
 namespace realsense_elevation_mapper
 {
@@ -11,6 +15,15 @@ namespace realsense_elevation_mapper
 // crop_roi semantics.
 void crop_roi(
   pcl::PointCloud<pcl::PointXYZ> & cloud,
+  float x_min, float x_max,
+  float y_min, float y_max,
+  float z_min, float z_max);
+
+// Same half-open box but for HeightMeasurement vectors (in-place). Used
+// after we've already bundled raw-derived variance into the measurements,
+// so we don't accidentally desynchronize a parallel variance vector.
+void crop_measurements_roi(
+  std::vector<HeightMeasurement> & measurements,
   float x_min, float x_max,
   float y_min, float y_max,
   float z_min, float z_max);

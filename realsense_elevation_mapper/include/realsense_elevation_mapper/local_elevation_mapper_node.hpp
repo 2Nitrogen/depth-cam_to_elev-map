@@ -24,21 +24,31 @@ namespace realsense_elevation_mapper
 //                                      + rgb (float32 packed), frame =
 //                                      camera_*_optical_frame, NaN allowed.
 //   raw  : pcl::PointCloud<PointXYZ>   M <= N (NaN removed), optical frame.
+//                                      Kept around to compute per-point
+//                                      measurement variance from the
+//                                      raw-frame depth.
 //   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (default odom,
-//                                      gravity-aligned per REP-103). Roll/
-//                                      pitch of the robot are removed by this
-//                                      transform; z is world-up.
+//                                      gravity-aligned per REP-103). Same
+//                                      ordering as raw, so raw[i] and
+//                                      transformed[i] always correspond.
+//   meas : std::vector<HeightMeasurement>  M, each entry bundles
+//                                      (target.x, target.y, target.z,
+//                                       R = compute_measurement_variance(raw[i])).
+//                                      From here on raw is unused; the
+//                                      pipeline operates on measurements
+//                                      so x/y/z and R never desynchronize.
 //   crop : same M' <= M, applied only when all six ROI bounds are
 //          provided in YAML (otherwise inspection mode -> no crop).
-//   buf  : deque of up to k_frames clouds; concat -> accumulated of
-//          size sum_i |c_i|.
+//   buf  : deque of up to k_frames measurement vectors; concat -> accumulated
+//          of size sum_i |m_i|.
 //   grid : std::vector<float> height_map, size = size_x * size_y,
 //          row-major with idx = ix * size_y + iy, NaN where count == 0.
 //          std::vector<int>   count_map  (parallel).
-//   out_a: sensor_msgs/PointCloud2 sum_i |c_i| points (x,y,z float32),
-//          frame = target_frame.
+//   out_a: sensor_msgs/PointCloud2 sum_i |m_i| points (x,y,z float32, rebuilt
+//          from accumulated measurements), frame = target_frame.
 //   out_e: sensor_msgs/PointCloud2 <= size_x * size_y points (one per
-//          occupied cell), (x,y) at cell center, z = per-cell estimate.
+//          occupied cell), (x,y) at cell center, z = per-cell estimate,
+//          intensity = sqrt(map estimate variance P).
 //
 // Frame semantics:
 //   target_frame      : the gravity-aligned global frame the map lives in
@@ -98,6 +108,9 @@ private:
 
   // Per-cell fusion tuning (see elevation_grid.hpp::FusionParams).
   FusionParams fusion_params_;
+  // When true, log per-callback min/mean/max of the measurement variance
+  // computed across the accumulated buffer (throttled).
+  bool debug_measurement_variance_{false};
   // When true, layers are reset at the start of every elevation publish so
   // the map represents only the current accumulated buffer. When false,
   // layers persist across callbacks and stale cells are aged out by
@@ -109,7 +122,11 @@ private:
   // derived state
   GridSpec grid_spec_;
   MapLayers layers_;
-  std::deque<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_buffer_;
+  // Last k_frames worth of measurements (target-frame xyz + per-point R).
+  // deque-of-vector keeps each point's variance bundled with its xyz so
+  // ROI cropping, concatenation, and frame-by-frame eviction never
+  // desynchronize the parallel data.
+  std::deque<std::vector<HeightMeasurement>> measurement_buffer_;
 
   // TF
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

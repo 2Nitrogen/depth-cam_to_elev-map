@@ -22,6 +22,40 @@ GridSpec make_grid_spec(
   return spec;
 }
 
+double compute_measurement_variance(
+  const pcl::PointXYZ & raw_point,
+  const FusionParams & params)
+{
+  double v = params.sensor_variance;
+
+  if (params.measurement_variance_model == MeasurementVarianceModel::DepthSquared) {
+    double depth = 0.0;
+    if (params.depth_source == DepthSource::RawZ) {
+      depth = static_cast<double>(raw_point.z);
+    } else {
+      const double rx = static_cast<double>(raw_point.x);
+      const double ry = static_cast<double>(raw_point.y);
+      const double rz = static_cast<double>(raw_point.z);
+      depth = std::sqrt(rx * rx + ry * ry + rz * rz);
+    }
+
+    if (!std::isfinite(depth) || depth <= 0.0) {
+      // Non-physical depth — fall back to the constant value.
+      v = params.sensor_variance;
+    } else {
+      v = params.sensor_noise_factor * depth * depth;
+    }
+  }
+
+  if (!std::isfinite(v) || v <= 0.0) {
+    v = params.sensor_variance;
+  }
+
+  return std::clamp(v,
+                    params.min_measurement_variance,
+                    params.max_measurement_variance);
+}
+
 void reset_layers(const GridSpec & spec, MapLayers & layers)
 {
   const std::size_t n = spec.size_x * spec.size_y;
@@ -58,15 +92,15 @@ void prune_stale_cells(MapLayers & layers, double now_sec, double max_age_sec)
   }
 }
 
-bool fuse_point_into_cell(
-  const pcl::PointXYZ & p,
+bool fuse_measurement_into_cell(
+  const HeightMeasurement & m,
   double stamp_sec,
   const GridSpec & spec,
   const FusionParams & params,
   MapLayers & layers)
 {
-  const double dx = (static_cast<double>(p.x) - spec.x_min) / spec.resolution;
-  const double dy = (static_cast<double>(p.y) - spec.y_min) / spec.resolution;
+  const double dx = (static_cast<double>(m.x) - spec.x_min) / spec.resolution;
+  const double dy = (static_cast<double>(m.y) - spec.y_min) / spec.resolution;
   if (dx < 0.0 || dy < 0.0) {
     return false;
   }
@@ -77,14 +111,20 @@ bool fuse_point_into_cell(
   }
   const std::size_t idx = ix * spec.size_y + iy;
 
-  const double v_meas = params.sensor_variance;
-  const double z_meas = static_cast<double>(p.z);
-  const double clamped_meas =
-    std::clamp(v_meas, params.min_variance, params.max_variance);
+  // Defensive re-clamp of R. compute_measurement_variance() should have
+  // already done this, but a stale-buffered measurement crossing a YAML
+  // bound change could be out of range.
+  const double v_meas = std::clamp(m.variance,
+                                   params.min_measurement_variance,
+                                   params.max_measurement_variance);
+  const double z_meas = static_cast<double>(m.z);
 
   if (layers.count_map[idx] == 0) {
+    // First measurement in this cell: store R clamped to the *map estimate*
+    // range so the posterior variance never starts outside P's range.
     layers.height_map[idx]    = static_cast<float>(z_meas);
-    layers.variance_map[idx]  = static_cast<float>(clamped_meas);
+    layers.variance_map[idx]  = static_cast<float>(
+      std::clamp(v_meas, params.min_variance, params.max_variance));
     layers.timestamp_map[idx] = stamp_sec;
     layers.count_map[idx]     = 1;
     return true;
@@ -92,8 +132,16 @@ bool fuse_point_into_cell(
 
   const double z_curr = static_cast<double>(layers.height_map[idx]);
   const double v_curr = static_cast<double>(layers.variance_map[idx]);
-  const double sigma_curr = std::sqrt(std::max(v_curr, params.min_variance));
-  const double mahalanobis = std::abs(z_meas - z_curr) / sigma_curr;
+
+  // Mahalanobis gate. With innovation variance (P + R) the test is
+  // statistically standard; without (legacy mode, just P) it gives a
+  // tighter gate that matches the prior fixed-variance behavior.
+  const double gate_variance =
+    params.mahalanobis_use_measurement_variance ? (v_curr + v_meas) : v_curr;
+  const double safe_gate_variance =
+    std::max(gate_variance, params.min_variance);
+  const double mahalanobis =
+    std::abs(z_meas - z_curr) / std::sqrt(safe_gate_variance);
 
   if (mahalanobis <= params.mahalanobis_threshold) {
     // 1D Kalman fusion.
@@ -121,7 +169,8 @@ bool fuse_point_into_cell(
       // count rather than "samples since last reseed"); same convention
       // as MonKey-Robotics / ANYbotics.
       layers.height_map[idx]   = static_cast<float>(z_meas);
-      layers.variance_map[idx] = static_cast<float>(clamped_meas);
+      layers.variance_map[idx] = static_cast<float>(
+        std::clamp(v_meas, params.min_variance, params.max_variance));
     } else {
       // Different scan window: bump variance to admit future correction.
       const double v_bumped = v_curr + params.multi_height_noise;
@@ -139,15 +188,15 @@ bool fuse_point_into_cell(
   return true;
 }
 
-void fuse_cloud(
-  const pcl::PointCloud<pcl::PointXYZ> & cloud,
+void fuse_measurements(
+  const std::vector<HeightMeasurement> & measurements,
   double stamp_sec,
   const GridSpec & spec,
   const FusionParams & params,
   MapLayers & layers)
 {
-  for (const auto & p : cloud.points) {
-    fuse_point_into_cell(p, stamp_sec, spec, params, layers);
+  for (const auto & m : measurements) {
+    fuse_measurement_into_cell(m, stamp_sec, spec, params, layers);
   }
 }
 

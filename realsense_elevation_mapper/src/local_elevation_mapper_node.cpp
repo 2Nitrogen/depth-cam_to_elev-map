@@ -6,6 +6,8 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -19,6 +21,46 @@
 
 namespace realsense_elevation_mapper
 {
+namespace
+{
+
+MeasurementVarianceModel parse_mv_model(const std::string & s)
+{
+  if (s == "constant")      { return MeasurementVarianceModel::Constant; }
+  if (s == "depth_squared") { return MeasurementVarianceModel::DepthSquared; }
+  throw std::runtime_error(
+    "Invalid measurement_variance_model '" + s +
+    "'. Valid options: 'constant', 'depth_squared'.");
+}
+
+DepthSource parse_depth_source(const std::string & s)
+{
+  if (s == "raw_z")      { return DepthSource::RawZ; }
+  if (s == "range_norm") { return DepthSource::RangeNorm; }
+  throw std::runtime_error(
+    "Invalid depth_source '" + s +
+    "'. Valid options: 'raw_z', 'range_norm'.");
+}
+
+const char * mv_model_str(MeasurementVarianceModel m)
+{
+  switch (m) {
+    case MeasurementVarianceModel::Constant:     return "constant";
+    case MeasurementVarianceModel::DepthSquared: return "depth_squared";
+  }
+  return "?";
+}
+
+const char * depth_source_str(DepthSource d)
+{
+  switch (d) {
+    case DepthSource::RawZ:      return "raw_z";
+    case DepthSource::RangeNorm: return "range_norm";
+  }
+  return "?";
+}
+
+}  // namespace
 
 LocalElevationMapperNode::LocalElevationMapperNode()
 : rclcpp::Node("local_elevation_mapper_node")
@@ -87,6 +129,26 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   enable_continuous_cleanup_           = declare_parameter<bool>("enable_continuous_cleanup", true);
   max_age_sec_                         = declare_parameter<double>("max_age_sec", 2.0);
 
+  // --- Per-point measurement variance R (see FusionParams docs) ---
+  // Defaults keep legacy behavior: every point gets R = sensor_variance.
+  const std::string mv_model_name =
+    declare_parameter<std::string>("measurement_variance_model", "constant");
+  const std::string depth_source_name =
+    declare_parameter<std::string>("depth_source", "raw_z");
+  fusion_params_.sensor_noise_factor =
+    declare_parameter<double>("sensor_noise_factor", 0.0009);
+  fusion_params_.min_measurement_variance =
+    declare_parameter<double>("min_measurement_variance", 0.000009);
+  fusion_params_.max_measurement_variance =
+    declare_parameter<double>("max_measurement_variance", 0.01);
+  fusion_params_.mahalanobis_use_measurement_variance =
+    declare_parameter<bool>("mahalanobis_use_measurement_variance", false);
+  debug_measurement_variance_ =
+    declare_parameter<bool>("debug_measurement_variance", false);
+
+  fusion_params_.measurement_variance_model = parse_mv_model(mv_model_name);
+  fusion_params_.depth_source = parse_depth_source(depth_source_name);
+
   if (roi_set_) {
     grid_spec_ = make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
   }
@@ -121,6 +183,18 @@ LocalElevationMapperNode::LocalElevationMapperNode()
       input_cloud_topic_.c_str(), target_frame_.c_str(),
       resolution_, k_frames_);
   }
+
+  RCLCPP_INFO(get_logger(),
+    "Measurement variance model: %s, depth source: %s, sensor_variance=%.6g, "
+    "sensor_noise_factor=%.6g, R clamp=[%.6g, %.6g], "
+    "mahalanobis_use_R=%s",
+    mv_model_str(fusion_params_.measurement_variance_model),
+    depth_source_str(fusion_params_.depth_source),
+    fusion_params_.sensor_variance,
+    fusion_params_.sensor_noise_factor,
+    fusion_params_.min_measurement_variance,
+    fusion_params_.max_measurement_variance,
+    fusion_params_.mahalanobis_use_measurement_variance ? "true" : "false");
 }
 
 void LocalElevationMapperNode::on_cloud(
@@ -197,41 +271,65 @@ void LocalElevationMapperNode::on_cloud(
     }
   }
 
+  // Build a HeightMeasurement per surviving point. raw[i] feeds R; the
+  // matching transformed[i] gives the target-frame (x, y, z) used for
+  // cell binning and the Kalman update on height. removeNaN was done
+  // in-place on raw, then transformPointCloud preserves ordering, so the
+  // indices line up.
+  std::vector<HeightMeasurement> measurements;
+  measurements.reserve(transformed->size());
+  for (std::size_t i = 0; i < transformed->size(); ++i) {
+    const auto & tp = transformed->points[i];
+    const auto & rp = raw->points[i];
+    measurements.push_back({
+      tp.x, tp.y, tp.z,
+      compute_measurement_variance(rp, fusion_params_),
+    });
+  }
+
   if (roi_set_) {
-    crop_roi(*transformed,
-             static_cast<float>(x_min_ + tp_dx), static_cast<float>(x_max_ + tp_dx),
-             static_cast<float>(y_min_ + tp_dy), static_cast<float>(y_max_ + tp_dy),
-             static_cast<float>(z_min_),        static_cast<float>(z_max_));
+    crop_measurements_roi(measurements,
+      static_cast<float>(x_min_ + tp_dx), static_cast<float>(x_max_ + tp_dx),
+      static_cast<float>(y_min_ + tp_dy), static_cast<float>(y_max_ + tp_dy),
+      static_cast<float>(z_min_),        static_cast<float>(z_max_));
   }
 
-  cloud_buffer_.push_back(transformed);
-  while (static_cast<int>(cloud_buffer_.size()) > k_frames_) {
-    cloud_buffer_.pop_front();
+  measurement_buffer_.push_back(std::move(measurements));
+  while (static_cast<int>(measurement_buffer_.size()) > k_frames_) {
+    measurement_buffer_.pop_front();
   }
 
-  // Concatenate buffered clouds for both downstream outputs.
-  auto accumulated = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  // Concatenate buffered measurement vectors for both downstream outputs.
+  std::vector<HeightMeasurement> accumulated;
   std::size_t total = 0;
-  for (const auto & c : cloud_buffer_) {
-    total += c->size();
+  for (const auto & f : measurement_buffer_) {
+    total += f.size();
   }
-  accumulated->points.reserve(total);
-  for (const auto & c : cloud_buffer_) {
-    *accumulated += *c;
+  accumulated.reserve(total);
+  for (const auto & f : measurement_buffer_) {
+    accumulated.insert(accumulated.end(), f.begin(), f.end());
   }
-  accumulated->width = static_cast<std::uint32_t>(accumulated->points.size());
-  accumulated->height = 1;
-  accumulated->is_dense = true;
 
   if (publish_accumulated_cloud_) {
+    // Rebuild a PointXYZ cloud (variance dropped) for the debug topic.
+    pcl::PointCloud<pcl::PointXYZ> accum_cloud;
+    accum_cloud.points.reserve(accumulated.size());
+    for (const auto & m : accumulated) {
+      pcl::PointXYZ p;
+      p.x = m.x; p.y = m.y; p.z = m.z;
+      accum_cloud.points.push_back(p);
+    }
+    accum_cloud.width = static_cast<std::uint32_t>(accum_cloud.points.size());
+    accum_cloud.height = 1;
+    accum_cloud.is_dense = true;
     sensor_msgs::msg::PointCloud2 out_msg;
-    pcl::toROSMsg(*accumulated, out_msg);
+    pcl::toROSMsg(accum_cloud, out_msg);
     out_msg.header.stamp = out_stamp;
     out_msg.header.frame_id = target_frame_;
     pub_accum_->publish(std::move(out_msg));
   }
 
-  if (publish_elevation_cloud_ && !accumulated->empty()) {
+  if (publish_elevation_cloud_ && !accumulated.empty()) {
     // Pick the grid spec for this frame. In ROI-set mode the bounds follow
     // the track point (configured bounds shifted by the target -> track
     // point translation). In inspection mode we auto-fit to the accumulated
@@ -249,11 +347,11 @@ void LocalElevationMapperNode::on_cloud(
       float max_x = -std::numeric_limits<float>::infinity();
       float min_y = std::numeric_limits<float>::infinity();
       float max_y = -std::numeric_limits<float>::infinity();
-      for (const auto & p : accumulated->points) {
-        min_x = std::min(min_x, p.x);
-        max_x = std::max(max_x, p.x);
-        min_y = std::min(min_y, p.y);
-        max_y = std::max(max_y, p.y);
+      for (const auto & m : accumulated) {
+        min_x = std::min(min_x, m.x);
+        max_x = std::max(max_x, m.x);
+        min_y = std::min(min_y, m.y);
+        max_y = std::max(max_y, m.y);
       }
       frame_spec = make_grid_spec(
         static_cast<double>(min_x), static_cast<double>(max_x) + resolution_,
@@ -276,7 +374,23 @@ void LocalElevationMapperNode::on_cloud(
       prune_stale_cells(layers_, stamp_sec, max_age_sec_);
     }
 
-    fuse_cloud(*accumulated, stamp_sec, frame_spec, fusion_params_, layers_);
+    fuse_measurements(accumulated, stamp_sec, frame_spec, fusion_params_, layers_);
+
+    if (debug_measurement_variance_) {
+      double min_v = std::numeric_limits<double>::infinity();
+      double max_v = -std::numeric_limits<double>::infinity();
+      double sum_v = 0.0;
+      for (const auto & m : accumulated) {
+        if (m.variance < min_v) min_v = m.variance;
+        if (m.variance > max_v) max_v = m.variance;
+        sum_v += m.variance;
+      }
+      const double mean_v = sum_v / static_cast<double>(accumulated.size());
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Measurement variance stats: min=%.6g, mean=%.6g, max=%.6g, count=%zu",
+        min_v, mean_v, max_v, accumulated.size());
+    }
+
     auto elev_pts = grid_to_xyzi_points(frame_spec, layers_, min_points_per_cell_);
 
     sensor_msgs::msg::PointCloud2 out_msg;
