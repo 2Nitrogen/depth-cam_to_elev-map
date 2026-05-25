@@ -28,8 +28,17 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   accumulated_cloud_topic_ = declare_parameter<std::string>("accumulated_cloud_topic", "/local_elevation_map/accumulated_points");
   elevation_cloud_topic_   = declare_parameter<std::string>("elevation_cloud_topic", "/local_elevation_map/points");
 
-  target_frame_ = declare_parameter<std::string>("target_frame", "base_link");
-  k_frames_     = declare_parameter<int>("k_frames", 5);
+  // target_frame is the gravity-aligned global frame the map lives in
+  // (default `odom`, redefined by state_estimator to be world-up with
+  // translation=[0,0,0] until real odometry is wired in).
+  target_frame_      = declare_parameter<std::string>("target_frame", "odom");
+  // track_point_frame is the body frame the local map window follows.
+  // When ROI bounds are set, they are interpreted as offsets relative to
+  // this frame's XY position in target_frame. For the stationary case
+  // (translation=0) the configured bounds and the effective bounds are the
+  // same; once translation is non-zero the grid auto-recenters.
+  track_point_frame_ = declare_parameter<std::string>("track_point_frame", "base_link");
+  k_frames_          = declare_parameter<int>("k_frames", 5);
 
   // map_length_x / map_length_y are kept in the yaml for documentation but the
   // grid is sized from x_max-x_min / y_max-y_min — declare them so loading the
@@ -67,6 +76,16 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   // Useful when replaying a bag whose message stamps don't match /clock
   // (e.g. RealSense sensor hardware time vs bag record time).
   use_latest_tf_ = declare_parameter<bool>("use_latest_tf", true);
+
+  // Per-cell fusion parameters (see FusionParams docs).
+  fusion_params_.sensor_variance       = declare_parameter<double>("sensor_variance", 0.0009);
+  fusion_params_.min_variance          = declare_parameter<double>("min_variance", 0.000009);
+  fusion_params_.max_variance          = declare_parameter<double>("max_variance", 0.01);
+  fusion_params_.mahalanobis_threshold = declare_parameter<double>("mahalanobis_threshold", 2.5);
+  fusion_params_.multi_height_noise    = declare_parameter<double>("multi_height_noise", 0.0000009);
+  fusion_params_.scanning_duration_sec = declare_parameter<double>("scanning_duration_sec", 0.5);
+  enable_continuous_cleanup_           = declare_parameter<bool>("enable_continuous_cleanup", true);
+  max_age_sec_                         = declare_parameter<double>("max_age_sec", 2.0);
 
   if (roi_set_) {
     grid_spec_ = make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
@@ -159,11 +178,30 @@ void LocalElevationMapperNode::on_cloud(
   auto transformed = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::transformPointCloud(*raw, *transformed, transform_f);
 
+  // Look up the track point's XY in target_frame so the ROI / grid window
+  // can follow the robot. With state_estimator forcing translation=0 this
+  // is currently always (0,0,0) — but the lookup keeps the code ready for
+  // when real odometry comes in.
+  double tp_dx = 0.0, tp_dy = 0.0;
+  if (track_point_frame_ != target_frame_) {
+    try {
+      const auto tp_tf = tf_buffer_->lookupTransform(
+        target_frame_, track_point_frame_,
+        lookup_time, tf2::durationFromSec(tf_timeout_sec_));
+      tp_dx = tp_tf.transform.translation.x;
+      tp_dy = tp_tf.transform.translation.y;
+    } catch (const tf2::TransformException & e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "track-point TF lookup failed (%s -> %s): %s. Treating offset as (0,0).",
+        target_frame_.c_str(), track_point_frame_.c_str(), e.what());
+    }
+  }
+
   if (roi_set_) {
     crop_roi(*transformed,
-             static_cast<float>(x_min_), static_cast<float>(x_max_),
-             static_cast<float>(y_min_), static_cast<float>(y_max_),
-             static_cast<float>(z_min_), static_cast<float>(z_max_));
+             static_cast<float>(x_min_ + tp_dx), static_cast<float>(x_max_ + tp_dx),
+             static_cast<float>(y_min_ + tp_dy), static_cast<float>(y_max_ + tp_dy),
+             static_cast<float>(z_min_),        static_cast<float>(z_max_));
   }
 
   cloud_buffer_.push_back(transformed);
@@ -194,14 +232,18 @@ void LocalElevationMapperNode::on_cloud(
   }
 
   if (publish_elevation_cloud_ && !accumulated->empty()) {
-    // Pick the grid spec for this frame. In ROI-set mode it's the static
-    // spec built at construction. In inspection mode we auto-fit to the
-    // accumulated cloud's actual XY extent so every valid point lands in
-    // some cell. Adding one resolution to max guards against floating-point
-    // rounding pushing the max-coordinate point one cell past the edge.
+    // Pick the grid spec for this frame. In ROI-set mode the bounds follow
+    // the track point (configured bounds shifted by the target -> track
+    // point translation). In inspection mode we auto-fit to the accumulated
+    // cloud's actual XY extent so every valid point lands in some cell.
+    // Adding one resolution to max guards against floating-point rounding
+    // pushing the max-coordinate point one cell past the edge.
     GridSpec frame_spec;
     if (roi_set_) {
-      frame_spec = grid_spec_;
+      frame_spec = make_grid_spec(
+        x_min_ + tp_dx, x_max_ + tp_dx,
+        y_min_ + tp_dy, y_max_ + tp_dy,
+        resolution_);
     } else {
       float min_x = std::numeric_limits<float>::infinity();
       float max_x = -std::numeric_limits<float>::infinity();
@@ -219,10 +261,23 @@ void LocalElevationMapperNode::on_cloud(
         resolution_);
     }
 
-    std::vector<float> height_map;
-    std::vector<int> count_map;
-    compute_mean_elevation(*accumulated, frame_spec, height_map, count_map);
-    auto elev_pts = grid_to_points(height_map, count_map, frame_spec, min_points_per_cell_);
+    const double stamp_sec = out_stamp.seconds();
+
+    // Continuous cleanup mode (default for the stationary case): start with
+    // a fresh grid every callback so the map mirrors the current
+    // accumulated buffer only. Otherwise reuse the persistent grid; if its
+    // shape changed we still have to resize, and stale cells are aged out
+    // by max_age_sec.
+    const bool shape_changed =
+      layers_.height_map.size() != frame_spec.size_x * frame_spec.size_y;
+    if (enable_continuous_cleanup_ || shape_changed) {
+      reset_layers(frame_spec, layers_);
+    } else {
+      prune_stale_cells(layers_, stamp_sec, max_age_sec_);
+    }
+
+    fuse_cloud(*accumulated, stamp_sec, frame_spec, fusion_params_, layers_);
+    auto elev_pts = grid_to_xyzi_points(frame_spec, layers_, min_points_per_cell_);
 
     sensor_msgs::msg::PointCloud2 out_msg;
     pcl::toROSMsg(*elev_pts, out_msg);

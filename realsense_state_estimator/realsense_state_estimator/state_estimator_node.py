@@ -1,13 +1,16 @@
 """state_estimator_node.
 
-Subscribes to RealSense IMU (combined or split), feeds samples into a
-StateEstimatorBase implementation, and publishes:
-  - tf: odom -> base_link
-  - nav_msgs/Odometry on a configurable topic
+Subscribes to an IMU topic (typically the Madgwick-filtered /imu/data, which
+has .orientation populated), feeds samples into a StateEstimatorBase
+implementation, and publishes:
+  - tf: odom -> base_link, with `odom` treated as gravity-aligned (REP-103
+        world-up).
+  - nav_msgs/Odometry on a configurable topic.
 
-The current default estimator is `identity`, which always reports the robot
-at the origin. Real estimators are dropped in by adding a new subclass and
-extending the `_make_estimator` factory.
+Default estimator is `gravity_from_imu` which extracts roll/pitch from the
+upstream quaternion, strips yaw, and forces translation = [0,0,0]. Drop in
+new estimators by subclassing StateEstimatorBase and extending the
+`_make_estimator` factory.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ from typing import Optional
 
 import numpy as np
 import rclpy
+import rclpy.time
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -22,16 +26,24 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
 import tf2_ros
 
-from .estimators import IdentityStateEstimator, Pose, StateEstimatorBase
+from .estimators import (
+    GravityFromImuQuaternion,
+    IdentityStateEstimator,
+    Pose,
+    StateEstimatorBase,
+)
 from .imu_utils import imu_msg_to_arrays, stamp_to_sec
 
 
 def _make_estimator(name: str) -> StateEstimatorBase:
     if name == 'identity':
         return IdentityStateEstimator()
+    if name == 'gravity_from_imu':
+        return GravityFromImuQuaternion()
     raise ValueError(
         f"Unknown estimator_type '{name}'. "
-        f"Valid options: 'identity'. Add new ones in _make_estimator."
+        f"Valid options: 'identity', 'gravity_from_imu'. "
+        f"Add new ones in _make_estimator."
     )
 
 
@@ -41,10 +53,10 @@ class StateEstimatorNode(Node):
 
         # --- parameters ---
         self.declare_parameter('imu_mode', 'combined')          # combined | split
-        self.declare_parameter('imu_topic', '/camera/camera/imu')
+        self.declare_parameter('imu_topic', '/imu/data')
         self.declare_parameter('accel_topic', '/camera/camera/accel/sample')
         self.declare_parameter('gyro_topic', '/camera/camera/gyro/sample')
-        self.declare_parameter('estimator_type', 'identity')
+        self.declare_parameter('estimator_type', 'gravity_from_imu')
 
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
@@ -83,6 +95,17 @@ class StateEstimatorNode(Node):
         # --- IMU rate stats ---
         self._imu_count_window = 0
         self._imu_window_start: Optional[float] = None
+
+        # --- TF: needed when the estimator requires the static imu->base
+        # rotation (e.g. GravityFromImuQuaternion composes q_world_imu with
+        # q_imu_base). Look up lazily on every IMU msg until success, then
+        # cache. This is robust to startup ordering — the RealSense wrapper
+        # may not have published its camera_link->imu_optical_frame static
+        # TF yet when this node starts.
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._needs_imu_to_base = hasattr(self.estimator, 'set_imu_to_base')
+        self._imu_to_base_done = False
 
         # --- pubs ---
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -127,8 +150,55 @@ class StateEstimatorNode(Node):
             f'publish_rate={self.publish_rate_hz}Hz'
         )
 
+    # ----- TF helper -----
+    def _try_inject_imu_to_base(self) -> None:
+        """Look up the static IMU->base rotation and forward it to the
+        estimator. Tried on every IMU callback until success.
+
+        Until success the estimator falls back to identity orientation
+        (no gravity correction). A throttled WARN every 10 s tells the
+        user the chain is incomplete; usual cause is a missing URDF /
+        robot_state_publisher or `publish_camera_mount:=false` without
+        an external publisher of base_link -> camera_link.
+        """
+        if not self._needs_imu_to_base or self._imu_to_base_done:
+            return
+        try:
+            tf_msg = self._tf_buffer.lookup_transform(
+                self.imu_frame,       # target: express vectors in imu coords
+                self.base_frame,      # source: from base coords
+                rclpy.time.Time(),    # latest available
+            )
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warning(
+                f'TF lookup {self.base_frame} -> {self.imu_frame} not '
+                f'available yet ({type(e).__name__}: {e}). Estimator is '
+                f'running with identity orientation until the chain is '
+                f'complete. Check that base_link -> camera_link is '
+                f'published (URDF / robot_state_publisher, or the '
+                f'bringup launch arg publish_camera_mount).',
+                throttle_duration_sec=10.0,
+            )
+            return
+        q = np.array([
+            tf_msg.transform.rotation.x,
+            tf_msg.transform.rotation.y,
+            tf_msg.transform.rotation.z,
+            tf_msg.transform.rotation.w,
+        ], dtype=np.float64)
+        self.estimator.set_imu_to_base(q)
+        self._imu_to_base_done = True
+        self.get_logger().info(
+            f'Loaded static rotation q({self.base_frame} -> {self.imu_frame} '
+            f'coords) into estimator: '
+            f'q(xyzw)=({q[0]:.4f}, {q[1]:.4f}, {q[2]:.4f}, {q[3]:.4f})'
+        )
+
     # ----- IMU callbacks -----
     def _on_imu(self, msg: Imu) -> None:
+        self._try_inject_imu_to_base()
         stamp_sec, acc, gyr, orient = imu_msg_to_arrays(msg)
         self.estimator.update_imu(stamp_sec, acc, gyr, orient)
         self._tally_imu(stamp_sec)

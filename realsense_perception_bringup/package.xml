@@ -14,6 +14,7 @@
 
   <exec_depend>realsense_elevation_mapper</exec_depend>
   <exec_depend>realsense_state_estimator</exec_depend>
+  <exec_depend>imu_filter_madgwick</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>tf2_ros</exec_depend>

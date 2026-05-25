@@ -1,15 +1,28 @@
 state_estimator_node:
   ros__parameters:
-    # combined: subscribe to /camera/camera/imu (sensor_msgs/Imu)
-    # split:    subscribe to /camera/camera/accel/sample + /gyro/sample
+    # combined: subscribe to a single sensor_msgs/Imu topic
+    # split:    subscribe to separate /accel/sample + /gyro/sample topics
     imu_mode: combined
-    imu_topic: /camera/camera/imu
+    # Default upstream: imu_filter_madgwick (started by the bringup launch)
+    # consumes /camera/camera/imu and publishes /imu/data with the
+    # `.orientation` quaternion populated. Set this back to
+    # /camera/camera/imu if you skip the filter.
+    imu_topic: /imu/data
     accel_topic: /camera/camera/accel/sample
     gyro_topic: /camera/camera/gyro/sample
 
-    # Currently only 'identity' is implemented. Future: madgwick, complementary, ekf.
-    estimator_type: identity
+    # 'identity'         : zero pose, used for bring-up / regression.
+    # 'gravity_from_imu' : compose the upstream IMU quaternion with the
+    #                      static imu->base rotation (looked up via TF),
+    #                      strip yaw, force translation = [0,0,0]. Result:
+    #                      gravity-aligned odom->base_link suitable for
+    #                      tilt-stable terrain mapping.
+    estimator_type: gravity_from_imu
 
+    # `odom` is treated as a gravity-aligned global frame: z is world-up
+    # (REP-103), translation is currently fixed at the origin, and roll/
+    # pitch come from the IMU. Future localization can plug in by swapping
+    # estimator_type.
     odom_frame: odom
     base_frame: base_link
     imu_frame: camera_imu_optical_frame

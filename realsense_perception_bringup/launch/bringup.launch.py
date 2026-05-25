@@ -3,10 +3,13 @@
 This launch assumes the RealSense ROS2 wrapper (realsense2_camera) is
 started separately, since the camera launch is environment-specific.
 
-When source:=rosbag, a static TF (parent->child as configured in
-camera_mount.json) is spawned to connect the state_estimator's
-odom->base_link subtree to the bag's camera_link->camera_*_optical_frame
-subtree. use_sim_time is also forced to true in this mode, since rosbag
+By default the launch publishes a static `base_link -> camera_link`
+transform from `config/camera_mount.json` so a desktop test (no URDF,
+just a D435i on a table) has a complete TF chain out of the box. If a
+URDF / robot_state_publisher is already publishing that edge, pass
+`publish_camera_mount:=false` to avoid a conflict.
+
+When source:=rosbag, use_sim_time is forced to true since rosbag
 playback only makes sense with --clock + sim time.
 """
 import json
@@ -26,6 +29,8 @@ from launch_ros.substitutions import FindPackageShare
 def _launch_setup(context, *args, **kwargs):
     source = LaunchConfiguration('source').perform(context)
     rviz_str = LaunchConfiguration('rviz').perform(context)
+    imu_filter_str = LaunchConfiguration('imu_filter').perform(context)
+    publish_camera_mount_str = LaunchConfiguration('publish_camera_mount').perform(context)
 
     use_sim_time_bool = (source == 'rosbag')
     use_sim_time_str = 'true' if use_sim_time_bool else 'false'
@@ -35,6 +40,28 @@ def _launch_setup(context, *args, **kwargs):
     bringup_pkg = FindPackageShare('realsense_perception_bringup').perform(context)
 
     actions = []
+
+    # imu_filter_madgwick: consumes raw accel+gyro on /camera/camera/imu and
+    # publishes /imu/data with .orientation populated. state_estimator's
+    # gravity_from_imu estimator depends on this. Disable only if you are
+    # supplying /imu/data from elsewhere.
+    if imu_filter_str.lower() == 'true':
+        actions.append(Node(
+            package='imu_filter_madgwick',
+            executable='imu_filter_madgwick_node',
+            name='imu_filter_madgwick',
+            output='screen',
+            parameters=[{
+                'use_mag': False,
+                'world_frame': 'enu',
+                'publish_tf': False,
+                'use_sim_time': use_sim_time_bool,
+            }],
+            remappings=[
+                ('imu/data_raw', '/camera/camera/imu'),
+                ('imu/data', '/imu/data'),
+            ],
+        ))
 
     actions.append(IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -60,7 +87,12 @@ def _launch_setup(context, *args, **kwargs):
             output='screen',
         ))
 
-    if source == 'rosbag':
+    # Publish the static base_link -> camera_link transform from
+    # camera_mount.json. Required for the TF chain in both live (when no
+    # URDF is providing it) and rosbag (no URDF at all) modes. Turn off
+    # via publish_camera_mount:=false if your URDF / robot_state_publisher
+    # already publishes that edge.
+    if publish_camera_mount_str.lower() == 'true':
         with open(f'{bringup_pkg}/config/camera_mount.json', 'r') as f:
             mount = json.load(f)
         t = mount['translation_m']
@@ -93,15 +125,30 @@ def generate_launch_description() -> LaunchDescription:
             choices=['live', 'rosbag'],
             description=(
                 'Data source: "live" for a real RealSense camera, "rosbag" '
-                'for replayed data. When "rosbag", use_sim_time is forced '
-                'to true and a static TF (parent/child from '
-                'config/camera_mount.json) is published to connect '
-                'base_link with camera_link.'
+                'for replayed data. "rosbag" forces use_sim_time:=true so '
+                'every node aligns with /clock.'
             ),
         ),
         DeclareLaunchArgument(
             'rviz', default_value='true',
             description='Launch RViz with the default perception config.',
+        ),
+        DeclareLaunchArgument(
+            'imu_filter', default_value='true',
+            description=(
+                'Spawn imu_filter_madgwick to derive /imu/data (with '
+                'orientation) from /camera/camera/imu. Set false if an '
+                'external node already publishes /imu/data.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'publish_camera_mount', default_value='true',
+            description=(
+                'Publish a static base_link -> camera_link TF from '
+                'config/camera_mount.json. Default true so a desktop D435i '
+                'test works without a URDF. Set false if your URDF / '
+                'robot_state_publisher already publishes that edge.'
+            ),
         ),
         OpaqueFunction(function=_launch_setup),
     ])

@@ -4,7 +4,15 @@ local_elevation_mapper_node:
     accumulated_cloud_topic: /local_elevation_map/accumulated_points
     elevation_cloud_topic: /local_elevation_map/points
 
-    target_frame: base_link
+    # target_frame: gravity-aligned global frame the elevation map lives in.
+    # The state_estimator publishes odom->base_link with roll/pitch from
+    # the IMU and translation=[0,0,0]; this means the map's z is world-up
+    # even when the robot body tilts.
+    target_frame: odom
+    # track_point_frame: body frame the ego-centric window follows. When
+    # ROI bounds (x_min..z_max) are set below, they are interpreted as
+    # offsets relative to this frame in target_frame's XY plane.
+    track_point_frame: base_link
     k_frames: 5
 
     map_length_x: 2.0
@@ -35,3 +43,24 @@ local_elevation_mapper_node:
     # recorded in RealSense sensor-time mode). Set to false for live cameras
     # with consistent timestamps when accurate per-frame TF interpolation matters.
     use_latest_tf: true
+
+    # --- Per-cell Kalman fusion ---
+    # See FusionParams in elevation_grid.hpp. Variances are in m^2.
+    sensor_variance: 0.0009          # (3 cm)^2 — constant measurement noise for v1
+    min_variance: 0.000009           # (3 mm)^2 — floor; keeps cells correctable
+    max_variance: 0.01               # (10 cm)^2 — ceiling / sanity rail
+    mahalanobis_threshold: 2.5       # multi-height gate (sigma)
+    multi_height_noise: 0.0000009    # variance bump for older outliers
+    scanning_duration_sec: 0.5       # ~ k_frames * frame_dt
+
+    # Continuous cleanup: rebuild the grid every callback so the map only
+    # reflects the current accumulated buffer. Right default while the
+    # robot is stationary (no incremental motion to integrate).
+    # Switch to false once real translation is published; then stale cells
+    # are aged out by max_age_sec instead.
+    # NOTE: this flag only matters in production (ROI bounds all set in
+    # YAML). In inspection mode (any ROI bound omitted), the grid extent
+    # auto-fits to the cloud each frame, so the layers are reset on every
+    # callback regardless of this setting.
+    enable_continuous_cleanup: true
+    max_age_sec: 2.0

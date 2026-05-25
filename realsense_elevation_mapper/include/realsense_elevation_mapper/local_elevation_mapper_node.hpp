@@ -24,7 +24,10 @@ namespace realsense_elevation_mapper
 //                                      + rgb (float32 packed), frame =
 //                                      camera_*_optical_frame, NaN allowed.
 //   raw  : pcl::PointCloud<PointXYZ>   M <= N (NaN removed), optical frame.
-//   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (base_link).
+//   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (default odom,
+//                                      gravity-aligned per REP-103). Roll/
+//                                      pitch of the robot are removed by this
+//                                      transform; z is world-up.
 //   crop : same M' <= M, applied only when all six ROI bounds are
 //          provided in YAML (otherwise inspection mode -> no crop).
 //   buf  : deque of up to k_frames clouds; concat -> accumulated of
@@ -37,9 +40,24 @@ namespace realsense_elevation_mapper
 //   out_e: sensor_msgs/PointCloud2 <= size_x * size_y points (one per
 //          occupied cell), (x,y) at cell center, z = per-cell estimate.
 //
+// Frame semantics:
+//   target_frame      : the gravity-aligned global frame the map lives in
+//                       (default `odom`). Elevation z and the XY grid plane
+//                       are expressed in this frame.
+//   track_point_frame : the body frame the local map window follows
+//                       (default `base_link`). When ROI bounds are set, they
+//                       are interpreted as offsets relative to this frame's
+//                       XY position in target_frame. Today translation is
+//                       forced to zero by the state estimator, so the
+//                       effective bounds equal the configured ones; once
+//                       real odometry comes in, the window will follow the
+//                       robot automatically.
+//
 // ROI / grid mode (chosen once at construction):
-//   * roi_set_ == true : ROI crop active, grid_spec_ static from YAML.
-//   * roi_set_ == false: inspection mode, no crop, grid_spec rebuilt
+//   * roi_set_ == true : ROI crop active. Grid extent each callback =
+//                        configured bounds shifted by the current
+//                        target_frame -> track_point_frame translation.
+//   * roi_set_ == false: inspection mode, no crop, grid extent rebuilt
 //                        each frame from the accumulated cloud's actual
 //                        XY extent so that every valid depth point shows
 //                        up in the elevation cloud.
@@ -55,7 +73,8 @@ private:
   std::string input_cloud_topic_;
   std::string accumulated_cloud_topic_;
   std::string elevation_cloud_topic_;
-  std::string target_frame_;
+  std::string target_frame_;       // gravity-aligned map frame
+  std::string track_point_frame_;  // body frame the window follows
   int k_frames_{5};
 
   // ROI bounds. NaN sentinel means "not provided in YAML" -> inspection
@@ -77,8 +96,19 @@ private:
   double tf_timeout_sec_{0.1};
   bool use_latest_tf_{true};
 
+  // Per-cell fusion tuning (see elevation_grid.hpp::FusionParams).
+  FusionParams fusion_params_;
+  // When true, layers are reset at the start of every elevation publish so
+  // the map represents only the current accumulated buffer. When false,
+  // layers persist across callbacks and stale cells are aged out by
+  // `max_age_sec`. Stationary use case favors true; locomotion will favor
+  // false once translation is wired in.
+  bool enable_continuous_cleanup_{true};
+  double max_age_sec_{2.0};
+
   // derived state
   GridSpec grid_spec_;
+  MapLayers layers_;
   std::deque<pcl::PointCloud<pcl::PointXYZ>::Ptr> cloud_buffer_;
 
   // TF

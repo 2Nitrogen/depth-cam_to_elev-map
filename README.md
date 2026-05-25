@@ -5,10 +5,6 @@ elevation map from the PointCloud2 / IMU topics published by a RealSense
 depth camera. The repository root doubles as the `src/` directory of a
 colcon workspace.
 
-Detailed design documents:
-- Overall elevation mapper design: [realsense_elevation_map_task_plan.md](realsense_elevation_map_task_plan.md)
-- IMU / state estimation design: `~/.claude/plans/realsense-misty-meteor.md`
-
 ---
 
 ## Packages
@@ -51,17 +47,20 @@ workspace root pulls these in automatically.
 
 ### (2) `realsense_state_estimator`
 
-Subscribes to the RealSense IMU topic and publishes TF
+Subscribes to a Madgwick-filtered IMU topic (`/imu/data`) and publishes TF
 (`odom -> base_link`) + `nav_msgs/Odometry` through the
-`StateEstimatorBase` interface. **Currently a placeholder
-(IdentityStateEstimator).** See
-[realsense_state_estimator/README.md](realsense_state_estimator/README.md)
+`StateEstimatorBase` interface. The default estimator is
+`gravity_from_imu`: it composes the upstream quaternion with the static
+`imu -> base_link` rotation, strips yaw, and forces translation to zero
+— giving a gravity-aligned `odom` frame stable under body roll/pitch.
+See [realsense_state_estimator/README.md](realsense_state_estimator/README.md)
 for details.
 
 Core files:
 - [state_estimator_node.py](realsense_state_estimator/realsense_state_estimator/state_estimator_node.py) — Core node (subs/pubs/timer)
 - [estimators/base.py](realsense_state_estimator/realsense_state_estimator/estimators/base.py) — `StateEstimatorBase` interface + `Pose`/`Twist` dataclass
 - [estimators/identity.py](realsense_state_estimator/realsense_state_estimator/estimators/identity.py) — Placeholder
+- [estimators/gravity_from_imu.py](realsense_state_estimator/realsense_state_estimator/estimators/gravity_from_imu.py) — Roll/pitch from a Madgwick IMU quaternion
 - [imu_utils.py](realsense_state_estimator/realsense_state_estimator/imu_utils.py) — `sensor_msgs/Imu` → numpy
 - [config/params.yaml](realsense_state_estimator/config/params.yaml) — IMU mode, frame, rate
 
@@ -79,25 +78,47 @@ for details.
 
 ```
 RealSense ROS2 wrapper
-   ├─ /camera/.../points  ──►  realsense_elevation_mapper
-   └─ /camera/.../imu     ──►  realsense_state_estimator
-                                     │
-                       publishes:    ▼
-                 TF: odom → base_link
-                 /state_estimator/odometry
-                                     │
-   realsense_elevation_mapper  ◄── tf2 lookup ──┘
-        │
-        ├─ /local_elevation_map/accumulated_points
-        └─ /local_elevation_map/points
-                  │
-                  ▼
-                 RViz
+   ├─ /camera/.../points  ───────────────────────────►  realsense_elevation_mapper
+   └─ /camera/.../imu  ──►  imu_filter_madgwick
+                              │
+                              │ /imu/data  (Imu w/ orientation)
+                              ▼
+                          realsense_state_estimator (gravity_from_imu)
+                              │
+                              │ TF: odom → base_link  (roll/pitch from IMU, pos=[0,0,0])
+                              │ /state_estimator/odometry
+                              ▼
+                          realsense_elevation_mapper  ◄── tf2 lookup ──┘
+                              │
+                              ├─ /local_elevation_map/accumulated_points
+                              └─ /local_elevation_map/points (PointXYZI, z=elev, i=σ)
+                                      │
+                                      ▼
+                                     RViz
 ```
 
-The two nodes are **coupled only through TF**. Even when the estimator is
-later swapped out for an EKF/VIO implementation, the elevation mapper
-code does not have to change.
+The three nodes (madgwick + state estimator + elevation mapper) are
+**coupled only through topics and TF**. Swapping the state estimator for
+an EKF/VIO implementation later does not require changing the elevation
+mapper.
+
+---
+
+## Frames
+
+| frame                          | semantics                                                      | publisher          |
+|--------------------------------|----------------------------------------------------------------|--------------------|
+| `odom`                         | gravity-aligned global (z = world-up, REP-103). Currently has translation [0,0,0] but the interface is ready for real localization. | state_estimator    |
+| `base_link`                    | robot body frame                                               | state_estimator (parent: odom) |
+| `camera_link`                  | RealSense camera body                                          | URDF / static TF   |
+| `camera_*_optical_frame`       | depth/color/imu optical frames (z forward, x right, y down)    | RealSense wrapper  |
+
+The elevation mapper transforms the input pointcloud to `target_frame`
+(default `odom`) so the grid's z is gravity-aligned. When you physically
+roll/pitch the robot, the raw pointcloud rotates with the camera but the
+elevation map stays approximately stable in `odom`. The local map window
+is centered on `track_point_frame` (default `base_link`) so it follows
+the robot's XY as soon as real translation is wired in.
 
 ---
 
