@@ -36,14 +36,7 @@ def _launch_setup(context, *args, **kwargs):
     use_sim_time_bool = (source == 'rosbag')
     use_sim_time_str = 'true' if use_sim_time_bool else 'false'
 
-    # imu_combine=auto: enable for rosbag (split-IMU bags are common), skip
-    # for live (the README recipe uses unite_imu_method:=2 so the wrapper
-    # already publishes a combined /camera/camera/imu). Explicit true/false
-    # overrides this.
-    if imu_combine_str.lower() == 'auto':
-        imu_combine_bool = (source == 'rosbag')
-    else:
-        imu_combine_bool = imu_combine_str.lower() == 'true'
+    imu_combine_bool = imu_combine_str.lower() == 'true'
 
     mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
     estimator_pkg = FindPackageShare('realsense_state_estimator').perform(context)
@@ -53,9 +46,10 @@ def _launch_setup(context, *args, **kwargs):
 
     # imu_combiner_node: merges split /accel/sample + /gyro/sample into
     # /camera/camera/imu (mirroring realsense2_camera's unite_imu_method
-    # behavior). Needed when the bag (or live wrapper) only provides the
-    # split topics. Skip when /camera/camera/imu already has a publisher
-    # (otherwise duplicates).
+    # behavior). The node is adaptive — it introspects the output topic
+    # at runtime and goes passive whenever another publisher is present,
+    # so it's safe to always launch regardless of whether the wrapper or
+    # bag already provides a combined topic.
     if imu_combine_bool:
         actions.append(Node(
             package='realsense_state_estimator',
@@ -166,15 +160,15 @@ def generate_launch_description() -> LaunchDescription:
             ),
         ),
         DeclareLaunchArgument(
-            'imu_combine', default_value='auto',
-            choices=['auto', 'true', 'false'],
+            'imu_combine', default_value='true',
+            choices=['true', 'false'],
             description=(
                 'Spawn imu_combiner_node to merge split /accel/sample + '
-                '/gyro/sample into /camera/camera/imu. "auto" enables for '
-                'source=rosbag (split-IMU bags common) and skips for '
-                'source=live (README recipe uses unite_imu_method:=2 so the '
-                'wrapper already publishes a combined topic). Force with '
-                'true/false if you know your IMU source.'
+                '/gyro/sample into /camera/camera/imu. The node is adaptive '
+                '(goes passive when another publisher already provides the '
+                'combined topic), so leaving this on is safe for both '
+                'unite_imu_method=2 and split-mode IMU sources, live or '
+                'replayed. Set false to skip launching it entirely.'
             ),
         ),
         DeclareLaunchArgument(
