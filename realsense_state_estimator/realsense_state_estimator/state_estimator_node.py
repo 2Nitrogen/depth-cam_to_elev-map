@@ -102,10 +102,19 @@ class StateEstimatorNode(Node):
         # cache. This is robust to startup ordering — the RealSense wrapper
         # may not have published its camera_link->imu_optical_frame static
         # TF yet when this node starts.
+        #
+        # The actual IMU frame name is taken from the first incoming Imu
+        # message's header.frame_id, NOT from the imu_frame parameter. This
+        # is how we auto-adapt to bags recorded in different modes:
+        #   - unite_imu_method:=2  -> header.frame_id == camera_imu_optical_frame
+        #   - split + our combiner -> header.frame_id == camera_gyro_optical_frame
+        # The configured imu_frame is only used as a fallback when the
+        # message header is empty.
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
         self._needs_imu_to_base = hasattr(self.estimator, 'set_imu_to_base')
         self._imu_to_base_done = False
+        self._imu_frame_observed: Optional[str] = None
 
         # --- pubs ---
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -160,12 +169,18 @@ class StateEstimatorNode(Node):
         user the chain is incomplete; usual cause is a missing URDF /
         robot_state_publisher or `publish_camera_mount:=false` without
         an external publisher of base_link -> camera_link.
+
+        Uses the frame_id observed on the wire (self._imu_frame_observed)
+        rather than the configured parameter, since the actual frame
+        depends on the upstream IMU source (combined vs split RealSense
+        modes produce different frame names).
         """
         if not self._needs_imu_to_base or self._imu_to_base_done:
             return
+        imu_frame = self._imu_frame_observed or self.imu_frame
         try:
             tf_msg = self._tf_buffer.lookup_transform(
-                self.imu_frame,       # target: express vectors in imu coords
+                imu_frame,            # target: express vectors in imu coords
                 self.base_frame,      # source: from base coords
                 rclpy.time.Time(),    # latest available
             )
@@ -173,7 +188,7 @@ class StateEstimatorNode(Node):
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             self.get_logger().warning(
-                f'TF lookup {self.base_frame} -> {self.imu_frame} not '
+                f'TF lookup {self.base_frame} -> {imu_frame} not '
                 f'available yet ({type(e).__name__}: {e}). Estimator is '
                 f'running with identity orientation until the chain is '
                 f'complete. Check that base_link -> camera_link is '
@@ -191,13 +206,40 @@ class StateEstimatorNode(Node):
         self.estimator.set_imu_to_base(q)
         self._imu_to_base_done = True
         self.get_logger().info(
-            f'Loaded static rotation q({self.base_frame} -> {self.imu_frame} '
+            f'Loaded static rotation q({self.base_frame} -> {imu_frame} '
             f'coords) into estimator: '
             f'q(xyzw)=({q[0]:.4f}, {q[1]:.4f}, {q[2]:.4f}, {q[3]:.4f})'
         )
 
+    def _observe_imu_frame(self, frame_id: str) -> None:
+        """Capture the first incoming IMU frame_id and warn on mismatch."""
+        if self._imu_frame_observed is not None:
+            return
+        observed = frame_id or ''
+        if not observed:
+            self._imu_frame_observed = self.imu_frame
+            self.get_logger().warning(
+                f'Incoming IMU header.frame_id is empty; falling back to '
+                f'configured imu_frame={self.imu_frame!r} for the IMU->base '
+                f'TF lookup.'
+            )
+            return
+        self._imu_frame_observed = observed
+        if observed != self.imu_frame:
+            self.get_logger().warning(
+                f'Configured imu_frame={self.imu_frame!r} but incoming IMU '
+                f'header.frame_id={observed!r}. Using the observed frame for '
+                f'the static IMU->base TF lookup; update the imu_frame '
+                f'parameter to silence this.'
+            )
+        else:
+            self.get_logger().info(
+                f'IMU frame_id observed: {observed!r} (matches imu_frame).'
+            )
+
     # ----- IMU callbacks -----
     def _on_imu(self, msg: Imu) -> None:
+        self._observe_imu_frame(msg.header.frame_id)
         self._try_inject_imu_to_base()
         stamp_sec, acc, gyr, orient = imu_msg_to_arrays(msg)
         self.estimator.update_imu(stamp_sec, acc, gyr, orient)

@@ -33,21 +33,24 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
-    - Class: rviz_default_plugins/TF
+    # RViz2's TF display always shows every frame it discovers (the
+    # "All Enabled: false" knob only applies to already-created frames;
+    # newly-discovered ones default back to enabled). To pin the view to
+    # exactly the two frames we care about regardless of what the bag /
+    # camera wrapper publishes, use two Axes displays instead.
+    - Class: rviz_default_plugins/Axes
       Enabled: true
-      Name: TF
-      Show Arrows: true
-      Show Axes: true
-      Show Names: true
-      Frames:
-        All Enabled: false
-        base_link:
-          Value: true
-        odom:
-          Value: true
-      Tree:
-        {}
-      Update Interval: 0
+      Length: 0.5
+      Name: OdomAxes
+      Radius: 0.025
+      Reference Frame: odom
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.3
+      Name: BaseLinkAxes
+      Radius: 0.015
+      Reference Frame: base_link
       Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true

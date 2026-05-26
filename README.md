@@ -177,6 +177,9 @@ sudo apt install \
     ros-humble-tf2-ros-py \
     python3-numpy
 
+# ROS2 Madgwick package
+sudo apt install ros-humble-imu-filter-madgwick
+
 # (optional) RealSense ROS2 wrapper
 sudo apt install ros-humble-realsense2-camera
 ```

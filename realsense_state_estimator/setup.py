@@ -27,6 +27,8 @@ setup(
         'console_scripts': [
             'state_estimator_node = '
             'realsense_state_estimator.state_estimator_node:main',
+            'imu_combiner_node = '
+            'realsense_state_estimator.imu_combiner_node:main',
         ],
     },
 )

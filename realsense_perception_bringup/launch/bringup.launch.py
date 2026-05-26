@@ -30,16 +30,40 @@ def _launch_setup(context, *args, **kwargs):
     source = LaunchConfiguration('source').perform(context)
     rviz_str = LaunchConfiguration('rviz').perform(context)
     imu_filter_str = LaunchConfiguration('imu_filter').perform(context)
+    imu_combine_str = LaunchConfiguration('imu_combine').perform(context)
     publish_camera_mount_str = LaunchConfiguration('publish_camera_mount').perform(context)
 
     use_sim_time_bool = (source == 'rosbag')
     use_sim_time_str = 'true' if use_sim_time_bool else 'false'
+
+    # imu_combine=auto: enable for rosbag (split-IMU bags are common), skip
+    # for live (the README recipe uses unite_imu_method:=2 so the wrapper
+    # already publishes a combined /camera/camera/imu). Explicit true/false
+    # overrides this.
+    if imu_combine_str.lower() == 'auto':
+        imu_combine_bool = (source == 'rosbag')
+    else:
+        imu_combine_bool = imu_combine_str.lower() == 'true'
 
     mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
     estimator_pkg = FindPackageShare('realsense_state_estimator').perform(context)
     bringup_pkg = FindPackageShare('realsense_perception_bringup').perform(context)
 
     actions = []
+
+    # imu_combiner_node: merges split /accel/sample + /gyro/sample into
+    # /camera/camera/imu (mirroring realsense2_camera's unite_imu_method
+    # behavior). Needed when the bag (or live wrapper) only provides the
+    # split topics. Skip when /camera/camera/imu already has a publisher
+    # (otherwise duplicates).
+    if imu_combine_bool:
+        actions.append(Node(
+            package='realsense_state_estimator',
+            executable='imu_combiner_node',
+            name='imu_combiner_node',
+            output='screen',
+            parameters=[{'use_sim_time': use_sim_time_bool}],
+        ))
 
     # imu_filter_madgwick: consumes raw accel+gyro on /camera/camera/imu and
     # publishes /imu/data with .orientation populated. state_estimator's
@@ -139,6 +163,18 @@ def generate_launch_description() -> LaunchDescription:
                 'Spawn imu_filter_madgwick to derive /imu/data (with '
                 'orientation) from /camera/camera/imu. Set false if an '
                 'external node already publishes /imu/data.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'imu_combine', default_value='auto',
+            choices=['auto', 'true', 'false'],
+            description=(
+                'Spawn imu_combiner_node to merge split /accel/sample + '
+                '/gyro/sample into /camera/camera/imu. "auto" enables for '
+                'source=rosbag (split-IMU bags common) and skips for '
+                'source=live (README recipe uses unite_imu_method:=2 so the '
+                'wrapper already publishes a combined topic). Force with '
+                'true/false if you know your IMU source.'
             ),
         ),
         DeclareLaunchArgument(
