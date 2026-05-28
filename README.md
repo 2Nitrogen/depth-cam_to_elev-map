@@ -1,8 +1,12 @@
 # realsense_pcd_to_elev_map
 
 This repository is a ROS2 perception software stack that builds a local
-elevation map from the PointCloud2 / IMU topics published by a RealSense
-depth camera. The repository root doubles as the `src/` directory of a
+terrain representation from the PointCloud2 / IMU topics published by a
+RealSense depth camera. Two output modes are selectable at launch time
+via `mode:=elev_map` (Kalman-fused 2D elevation grid, default) or
+`mode:=fast_mesh` (PCL `OrganizedFastMesh` single-frame mesh baseline).
+Both share the same upstream pipeline (Madgwick IMU → gravity-aligned
+`odom`). The repository root doubles as the `src/` directory of a
 colcon workspace.
 
 ---
@@ -11,9 +15,10 @@ colcon workspace.
 
 ```
 realsense_pcd_to_elev_map/                  (colcon workspace src)
-├─ realsense_elevation_mapper/              (1) PointCloud2 → elevation grid
-├─ realsense_state_estimator/               (2) IMU subscription + state estimation skeleton
-└─ realsense_perception_bringup/            (3) combined bring-up launch + RViz config
+├─ realsense_elevation_mapper/              (1) PointCloud2 → Kalman-fused elevation grid (mode=elev_map)
+├─ realsense_fast_mesh_baseline/            (2) depth Image → organized cloud → mesh (mode=fast_mesh)
+├─ realsense_state_estimator/               (3) IMU subscription + state estimation
+└─ realsense_perception_bringup/            (4) combined bring-up launch + RViz config + mode switch
 ```
 
 ### (1) `realsense_elevation_mapper` (C++)
@@ -45,7 +50,50 @@ Extra system dependencies for this package (beyond a ROS2 desktop install):
 installed, `rosdep install --from-paths . --ignore-src -y` at the
 workspace root pulls these in automatically.
 
-### (2) `realsense_state_estimator`
+### (2) `realsense_fast_mesh_baseline` (C++)
+
+Alternative single-frame perception mode (selectable via
+`mode:=fast_mesh` on the bringup launch). Subscribes to the depth
+`Image` + `CameraInfo` (NOT the wrapper's PointCloud2 — many bags are
+recorded with the wrapper's `pointcloud.ordered_pc=false`, which strips
+NaN and breaks all PCL organized algorithms), reconstructs an organized
+cloud locally, runs a manual cross-product normal estimator, runs PCL's
+`OrganizedFastMesh` for triangulation, and publishes a
+`visualization_msgs/MarkerArray` with **three** sub-markers:
+
+- `id=0  POINTS`         — opaque vertex dots (slope-colored).
+- `id=1  TRIANGLE_LIST`  — faint slope-colored face surfaces.
+- `id=2  LINE_LIST`      — light-gray wireframe edges.
+
+Visualization-only baseline; designed as a known-good reference against
+which custom multi-frame fusion / plane-segmentation experiments are
+compared. See [`docs/algorithm.md`](realsense_fast_mesh_baseline) (TBD)
+for the per-callback pipeline. Core files:
+
+- [src/main.cpp](realsense_fast_mesh_baseline/src/main.cpp) — Entry point
+- [src/fast_mesh_node.cpp](realsense_fast_mesh_baseline/src/fast_mesh_node.cpp) — Node body (subs/pubs/TF orchestration)
+- [src/mesh_builder.cpp](realsense_fast_mesh_baseline/src/mesh_builder.cpp) — Depth → organized cloud + normal estimation + OrganizedFastMesh wrappers
+- [src/mesh_marker.cpp](realsense_fast_mesh_baseline/src/mesh_marker.cpp) — Mesh → MarkerArray (POINTS + TRIANGLE_LIST + LINE_LIST)
+- [include/realsense_fast_mesh_baseline/](realsense_fast_mesh_baseline/include/realsense_fast_mesh_baseline/) — Public headers
+- [CMakeLists.txt](realsense_fast_mesh_baseline/CMakeLists.txt) — Build configuration
+- [config/params.yaml](realsense_fast_mesh_baseline/config/params.yaml) — Parameters
+
+Notable design points:
+
+- **`IntegralImageNormalEstimation` is intentionally NOT used**. On the
+  Ubuntu 22.04 / PCL 1.12 / Eigen 3.4 combo this PCL function aborts
+  inside Eigen (`variable_if_dynamic<long,3>`) regardless of estimation
+  method on RealSense-class clouds. The cross-product approach is O(N),
+  has no Eigen internals to trip, and respects the same
+  `max_depth_change_factor` discontinuity-rejection semantics.
+- **`pixel_stride` parameter** downsamples the input depth image (every
+  Nth pixel along both axes) so the mesh isn't sub-pixel-dense.
+  `triangle_max_edge_length` is auto-computed as
+  `pixel_stride × kBaseEdgeLengthPerStride` (constant in
+  [`mesh_builder.hpp`](realsense_fast_mesh_baseline/include/realsense_fast_mesh_baseline/mesh_builder.hpp))
+  so the discontinuity threshold tracks vertex spacing automatically.
+
+### (3) `realsense_state_estimator`
 
 Subscribes to a Madgwick-filtered IMU topic (`/imu/data`) and publishes TF
 (`odom -> base_link`) + `nav_msgs/Odometry` through the
@@ -64,11 +112,14 @@ Core files:
 - [imu_utils.py](realsense_state_estimator/realsense_state_estimator/imu_utils.py) — `sensor_msgs/Imu` → numpy
 - [config/params.yaml](realsense_state_estimator/config/params.yaml) — IMU mode, frame, rate
 
-### (3) `realsense_perception_bringup`
+### (4) `realsense_perception_bringup`
 
-A combined launch that brings up (1) and (2) together with a preset RViz
-config. It does not include the RealSense camera wrapper itself; that is
-expected to be running separately. See
+A combined launch that brings up the state estimator + Madgwick IMU
+filter + IMU combiner + camera-mount static TF + RViz, and selects
+between the elevation mapper (mode=elev_map, default) or the fast-mesh
+baseline (mode=fast_mesh) via the `mode:=` launch argument. Does not
+include the RealSense camera wrapper itself; that is expected to be
+running separately. See
 [realsense_perception_bringup/README.md](realsense_perception_bringup/README.md)
 for details.
 
@@ -78,7 +129,8 @@ for details.
 
 ```
 RealSense ROS2 wrapper
-   ├─ /camera/.../points  ───────────────────────────►  realsense_elevation_mapper
+   ├─ /camera/.../points ─────────────────────►  realsense_elevation_mapper   (mode=elev_map)
+   ├─ /camera/.../depth/image_rect_raw + camera_info ─►  realsense_fast_mesh_baseline (mode=fast_mesh)
    └─ /camera/.../imu  ──►  imu_filter_madgwick
                               │
                               │ /imu/data  (Imu w/ orientation)
@@ -88,19 +140,22 @@ RealSense ROS2 wrapper
                               │ TF: odom → base_link  (roll/pitch from IMU, pos=[0,0,0])
                               │ /state_estimator/odometry
                               ▼
-                          realsense_elevation_mapper  ◄── tf2 lookup ──┘
+                          { elevation_mapper | fast_mesh_baseline }  ◄── tf2 lookup ──┘
                               │
-                              ├─ /local_elevation_map/accumulated_points
-                              └─ /local_elevation_map/points (PointXYZI, z=elev, i=σ)
+                              ├─ mode=elev_map    : /local_elevation_map/accumulated_points
+                              │                     /local_elevation_map/points (PointXYZI, z=elev, i=σ)
+                              └─ mode=fast_mesh   : /local_fast_mesh/mesh
+                                                    (MarkerArray: POINTS + TRIANGLE_LIST + LINE_LIST)
                                       │
                                       ▼
                                      RViz
 ```
 
-The three nodes (madgwick + state estimator + elevation mapper) are
-**coupled only through topics and TF**. Swapping the state estimator for
-an EKF/VIO implementation later does not require changing the elevation
-mapper.
+The pipeline nodes (madgwick + state estimator + the selected mapper)
+are **coupled only through topics and TF**. The two mapper modes are
+mutually exclusive — only one runs per launch, picked by `mode:=`.
+Swapping the state estimator for an EKF/VIO implementation later does
+not require changing either mapper.
 
 ---
 
@@ -210,12 +265,13 @@ cd /home/sequor/realsense_pcd_to_elev_map
 rm -rf build install log     # wipe old artifacts
 colcon build
 source install/setup.bash
-colcon list                  # all 3 packages must show up
+colcon list                  # all 4 packages must show up
 ```
 
 Expected output:
 ```
 realsense_elevation_mapper      realsense_elevation_mapper      (ros.ament_cmake)
+realsense_fast_mesh_baseline    realsense_fast_mesh_baseline    (ros.ament_cmake)
 realsense_perception_bringup    realsense_perception_bringup    (ros.ament_cmake)
 realsense_state_estimator       realsense_state_estimator       (ros.ament_python)
 ```
@@ -251,12 +307,18 @@ ros2 launch realsense2_camera rs_launch.py \
     pointcloud.enable:=true enable_gyro:=true enable_accel:=true unite_imu_method:=2
 
 # 2. Perception stack + RViz
-ros2 launch realsense_perception_bringup bringup.launch.py
+ros2 launch realsense_perception_bringup bringup.launch.py            # default: mode=elev_map
+ros2 launch realsense_perception_bringup bringup.launch.py mode:=fast_mesh
 ```
 
-The bringup takes a `source:=` argument that selects the data source.
-`source:=live` (the default) runs against a live RealSense camera as
-above. `source:=rosbag` is described below.
+Two launch-time switches are commonly used:
+
+- `mode:=elev_map | fast_mesh` — pick the mapper. `elev_map` (default)
+  emits a Kalman-fused 2D elevation grid as `PointCloud2`. `fast_mesh`
+  emits a single-frame triangle mesh as `MarkerArray`.
+- `source:=live | rosbag` — `live` (default) runs against the live
+  RealSense; `rosbag` flips `use_sim_time:=true` for every node and
+  publishes a `base_link → camera_link` static TF (see TF note below).
 
 > **TF note**: a static transform connecting the RealSense camera frame to
 > `base_link` is required. On an actual robot, the URDF /
@@ -471,15 +533,16 @@ external yaml injection, add `launch_arguments={'params_file': ...}` to the
 
 - Package names keep the `realsense_*` prefix.
 - Separate ROS-independent code (C++: `elevation_grid.cpp` /
-  `pointcloud_utils.cpp`; Python: `estimators/base.py`, `imu_utils.py`)
-  from ROS node code (`*_node.cpp` / `*_node.py`). The former is
-  unit-test friendly.
+  `pointcloud_utils.cpp` / `mesh_builder.cpp` / `mesh_marker.cpp`;
+  Python: `estimators/base.py`, `imu_utils.py`) from ROS node code
+  (`*_node.cpp` / `*_node.py`). The former is unit-test friendly.
 - Language-by-package rule of thumb: **C++** for hot paths and
-  PCL/Eigen-heavy work (currently `realsense_elevation_mapper`),
-  **Python** for orchestration and abstract-interface-driven logic
-  (currently `realsense_state_estimator`; launch-only packages like
-  `realsense_perception_bringup` use `ament_cmake` for install rules only).
-  Apply the same rule when adding new packages.
+  PCL/Eigen-heavy work (currently `realsense_elevation_mapper` and
+  `realsense_fast_mesh_baseline`), **Python** for orchestration and
+  abstract-interface-driven logic (currently `realsense_state_estimator`;
+  launch-only packages like `realsense_perception_bringup` use
+  `ament_cmake` for install rules only). Apply the same rule when
+  adding new packages.
 - Every parameter lives in yaml; nodes load them via
   `declare_parameter` + `get_parameter` (same API in rclcpp and rclpy).
 - When adding a new estimator / output format, **add a new file** and limit

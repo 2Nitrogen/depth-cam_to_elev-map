@@ -92,13 +92,24 @@ def _launch_setup(context, *args, **kwargs):
     # pipeline (state_estimator, IMU, camera mount static TF). They are
     # mutually exclusive — switching at launch time avoids running
     # multiple mappers on the same input cloud, which would be wasteful.
+    #
+    # NOTE on params_file: the state_estimator include (above) declares
+    # its own `params_file` LaunchConfiguration. ROS2 launch keeps the
+    # first declaration's value when a name is declared twice across
+    # nested includes, so a child mapper launch that also declares
+    # `params_file` would silently inherit state_estimator's yaml and
+    # see none of its own keys. We side-step that by passing the
+    # mapper's own params_file explicitly here.
     if mode == 'elev_map':
         mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 f'{mapper_pkg}/launch/local_elevation_mapper.launch.py'
             ),
-            launch_arguments={'use_sim_time': use_sim_time_str}.items(),
+            launch_arguments={
+                'use_sim_time': use_sim_time_str,
+                'params_file': f'{mapper_pkg}/config/params.yaml',
+            }.items(),
         ))
     elif mode == 'fast_mesh':
         mapper_pkg = FindPackageShare('realsense_fast_mesh_baseline').perform(context)
@@ -106,7 +117,10 @@ def _launch_setup(context, *args, **kwargs):
             PythonLaunchDescriptionSource(
                 f'{mapper_pkg}/launch/fast_mesh_baseline.launch.py'
             ),
-            launch_arguments={'use_sim_time': use_sim_time_str}.items(),
+            launch_arguments={
+                'use_sim_time': use_sim_time_str,
+                'params_file': f'{mapper_pkg}/config/params.yaml',
+            }.items(),
         ))
     else:
         # DeclareLaunchArgument(choices=...) already validates, but defend

@@ -27,6 +27,18 @@ local_fast_mesh_node:
     use_latest_tf:           true
     cloud_queue_size:        5
 
+    # ---- Pixel stride (cloud downsampling) ----
+    # Take every Nth pixel of the depth image along both axes when
+    # reconstructing the organized cloud. stride=1 keeps every pixel
+    # (densest mesh, ~vertex count = image resolution); stride=2 quarters
+    # the vertex count (4x fewer); stride=N gives N²-fold reduction.
+    # The output cloud stays organized so OrganizedFastMesh still works.
+    # Heuristic: if mesh looks "painted" / triangles are sub-pixel, bump
+    # stride up to 3-4. Note: increasing stride means vertices are
+    # farther apart in 3D at the same depth, so triangle_max_edge_length
+    # below may need to scale roughly linearly with stride.
+    pixel_stride:             10
+
     # ---- IntegralImageNormalEstimation ----
     # Patch size (image pixels) over which the local plane is fitted to
     # estimate the normal. Larger = smoother normals, less per-pixel
@@ -40,9 +52,11 @@ local_fast_mesh_node:
     max_depth_change_factor:  0.02
 
     # ---- OrganizedFastMesh ----
-    # Adjacent vertices farther than this in 3D are NOT connected into
-    # a triangle (creates a depth-jump cut, e.g. at step edges).
-    triangle_max_edge_length: 0.10
+    # Note: triangle_max_edge_length is NOT exposed here. The node
+    # computes it at runtime as `pixel_stride * 0.10 m` so the
+    # depth-discontinuity threshold scales naturally with vertex
+    # spacing. Edit kBaseEdgeLengthPerStride in mesh_builder.hpp if you
+    # need to retune the base unit.
     # Triangulation pattern. Valid:
     #   TRIANGLE_RIGHT_CUT      (each quad cut along the "\" diagonal)
     #   TRIANGLE_LEFT_CUT       (each quad cut along the "/" diagonal)
@@ -53,7 +67,27 @@ local_fast_mesh_node:
     triangulation_type:       "TRIANGLE_ADAPTIVE_CUT"
 
     # ---- Visualization ----
-    # Slope angle (rad) at which color ramp starts (green) and ends (red).
-    # Slope is arccos(|n . z_up|) computed in target_frame.
+    # The node publishes a MarkerArray with THREE markers per frame:
+    #   id=0  POINTS         — opaque vertex dots (point_size_m wide)
+    #   id=1  TRIANGLE_LIST  — faint mesh faces (alpha=face_alpha)
+    #   id=2  LINE_LIST      — wireframe edges in light gray
+    #                          (edge_width_m wide, alpha=edge_alpha)
+    # POINTS + TRIANGLE_LIST are slope-colored; LINE_LIST is a fixed
+    # neutral gray so it doesn't compete with the slope coloring.
+    #
+    # Slope angle (rad) at which the green→red color ramp starts and ends.
     color_min_slope_rad:      0.0
     color_max_slope_rad:      0.785   # ~45 deg
+    # Vertex point size (m, world-scale). Roughly tune to the typical
+    # inter-vertex spacing at your working depth so dots don't overlap
+    # too much. With pixel_stride=10 at depth 1m, ~17mm spacing, so
+    # 0.01 m (10 mm) gives visible but non-touching dots.
+    point_size_m:             0.01
+    # Triangle face alpha in [0, 1]. Lower = more see-through, lets
+    # the vertex dots dominate the visualization.
+    face_alpha:               0.3
+    # Wireframe edge line width (m, world-scale) and alpha in [0, 1].
+    # Default is a thin pale gray (2 mm, 50% alpha) — strong enough to
+    # convey mesh connectivity but subordinate to the slope colors.
+    edge_width_m:             0.002
+    edge_alpha:               0.5

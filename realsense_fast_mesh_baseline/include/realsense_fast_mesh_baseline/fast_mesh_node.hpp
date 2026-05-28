@@ -33,7 +33,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "realsense_fast_mesh_baseline/mesh_builder.hpp"
 #include "realsense_fast_mesh_baseline/mesh_marker.hpp"
@@ -79,7 +79,7 @@ private:
   // ---- ROS interfaces ----
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_marker_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker_;
 };
 
 }  // namespace realsense_fast_mesh_baseline

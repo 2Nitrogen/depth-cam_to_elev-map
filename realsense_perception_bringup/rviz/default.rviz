@@ -101,9 +101,11 @@ Visualization Manager:
       Use rainbow: false
       Value: true
     # FastMesh: active when bringup is launched with mode:=fast_mesh.
+    # The node publishes a MarkerArray with two markers: opaque POINTS
+    # (id=0) for vertices + faint TRIANGLE_LIST (id=1) for face surfaces.
     # The elev_map and fast_mesh modes never run together, so each
     # mode's display sits idle (no traffic, no impact) when not selected.
-    - Class: rviz_default_plugins/Marker
+    - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: FastMesh
       Namespaces:

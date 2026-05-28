@@ -32,12 +32,22 @@ FastMeshNode::FastMeshNode()
   use_latest_tf_    = declare_parameter<bool>(  "use_latest_tf",    true);
   cloud_queue_size_ = declare_parameter<int>(   "cloud_queue_size", 5);
 
+  // pixel_stride: ROS2 parameter API doesn't have uint32, so accept as
+  // int (default 1) and clamp to >=1 before stashing.
+  {
+    const int s = declare_parameter<int>("pixel_stride", 1);
+    builder_params_.pixel_stride = static_cast<std::uint32_t>(std::max(1, s));
+  }
   builder_params_.normal_smoothing_size =
     static_cast<float>(declare_parameter<double>("normal_smoothing_size", 20.0));
   builder_params_.max_depth_change_factor =
     static_cast<float>(declare_parameter<double>("max_depth_change_factor", 0.02));
+  // triangle_max_edge_length is intentionally NOT a yaml knob — it
+  // scales linearly with pixel_stride via kBaseEdgeLengthPerStride so
+  // that the rejected-as-discontinuity threshold tracks vertex spacing
+  // automatically. See mesh_builder.hpp for the rationale.
   builder_params_.triangle_max_edge_length =
-    static_cast<float>(declare_parameter<double>("triangle_max_edge_length", 0.10));
+    static_cast<float>(builder_params_.pixel_stride) * kBaseEdgeLengthPerStride;
   builder_params_.triangulation_type = parse_triangulation_type(
     declare_parameter<std::string>("triangulation_type", "TRIANGLE_ADAPTIVE_CUT"));
 
@@ -45,6 +55,14 @@ FastMeshNode::FastMeshNode()
     declare_parameter<double>("color_min_slope_rad", 0.0);
   marker_style_.color_max_slope_rad =
     declare_parameter<double>("color_max_slope_rad", 0.785);
+  marker_style_.point_size_m =
+    declare_parameter<double>("point_size_m", 0.01);
+  marker_style_.face_alpha =
+    declare_parameter<double>("face_alpha", 0.3);
+  marker_style_.edge_width_m =
+    declare_parameter<double>("edge_width_m", 0.002);
+  marker_style_.edge_alpha =
+    declare_parameter<double>("edge_alpha", 0.5);
 
   // ---- TF ----
   tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -65,20 +83,26 @@ FastMeshNode::FastMeshNode()
     camera_info_topic_, rclcpp::QoS{1}.reliable(),
     std::bind(&FastMeshNode::on_camera_info, this, std::placeholders::_1));
   pub_marker_ =
-    create_publisher<visualization_msgs::msg::Marker>(mesh_marker_topic_, 1);
+    create_publisher<visualization_msgs::msg::MarkerArray>(mesh_marker_topic_, 1);
 
   RCLCPP_INFO(get_logger(),
     "Subscribed to depth=%s + camera_info=%s -> target_frame=%s "
-    "normal_smoothing=%.2fpx max_depth_change=%.4f triangle_max_edge=%.3fm "
-    "triangulation=%s color_slope=[%.3f..%.3f]rad",
+    "pixel_stride=%u normal_smoothing=%.2fpx max_depth_change=%.4f "
+    "triangle_max_edge=%.3fm triangulation=%s color_slope=[%.3f..%.3f]rad "
+    "point_size=%.3fm face_alpha=%.2f edge_width=%.4fm edge_alpha=%.2f",
     depth_image_topic_.c_str(), camera_info_topic_.c_str(),
     target_frame_.c_str(),
+    builder_params_.pixel_stride,
     builder_params_.normal_smoothing_size,
     builder_params_.max_depth_change_factor,
     builder_params_.triangle_max_edge_length,
     triangulation_type_str(builder_params_.triangulation_type),
     marker_style_.color_min_slope_rad,
-    marker_style_.color_max_slope_rad);
+    marker_style_.color_max_slope_rad,
+    marker_style_.point_size_m,
+    marker_style_.face_alpha,
+    marker_style_.edge_width_m,
+    marker_style_.edge_alpha);
 }
 
 void FastMeshNode::on_camera_info(sensor_msgs::msg::CameraInfo::ConstSharedPtr msg)
@@ -102,7 +126,7 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   // ---- Build organized cloud from depth image + intrinsics ----
   pcl::PointCloud<pcl::PointXYZ>::Ptr cam_cloud;
   try {
-    cam_cloud = build_organized_cloud_from_depth(*msg, *cached_camera_info_);
+    cam_cloud = build_organized_cloud_from_depth(*msg, *cached_camera_info_, builder_params_);
   } catch (const std::runtime_error & e) {
     RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
       "Failed to build cloud from depth image: %s", e.what());
@@ -187,10 +211,10 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   RCLCPP_INFO_ONCE(get_logger(),
     "[7/7] Mesh built: %zu polygons", mesh.polygons.size());
 
-  // ---- Serialize to Marker + publish ----
-  auto marker = mesh_to_triangle_list_marker(
+  // ---- Serialize to MarkerArray + publish ----
+  auto marker_array = mesh_to_marker_array(
     mesh, *tgt_normals, out_stamp, target_frame_, marker_style_);
-  pub_marker_->publish(std::move(marker));
+  pub_marker_->publish(std::move(marker_array));
 }
 
 }  // namespace realsense_fast_mesh_baseline
