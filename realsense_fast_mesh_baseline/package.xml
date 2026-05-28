@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>realsense_fast_mesh_baseline</name>
+  <version>0.1.0</version>
+  <description>
+    Vanilla single-frame mesh baseline. Subscribes to an organized depth
+    PointCloud2, runs pcl::IntegralImageNormalEstimation +
+    pcl::OrganizedFastMesh, and publishes a visualization_msgs/Marker
+    (TRIANGLE_LIST) with per-vertex slope coloring. Acts as the reference
+    "what does PCL give us for free?" baseline against which custom
+    mesh / surfel work is compared.
+  </description>
+  <maintainer email="dev@sequorrobotics.com">sequor</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+  <depend>tf2_sensor_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>eigen</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

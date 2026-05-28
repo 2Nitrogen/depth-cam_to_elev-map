@@ -13,6 +13,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <exec_depend>realsense_elevation_mapper</exec_depend>
+  <exec_depend>realsense_fast_mesh_baseline</exec_depend>
   <exec_depend>realsense_state_estimator</exec_depend>
   <exec_depend>imu_filter_madgwick</exec_depend>
   <exec_depend>rviz2</exec_depend>

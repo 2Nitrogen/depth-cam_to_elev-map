@@ -100,6 +100,21 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
+    # FastMesh: active when bringup is launched with mode:=fast_mesh.
+    # The elev_map and fast_mesh modes never run together, so each
+    # mode's display sits idle (no traffic, no impact) when not selected.
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: FastMesh
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /local_fast_mesh/mesh
+      Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1

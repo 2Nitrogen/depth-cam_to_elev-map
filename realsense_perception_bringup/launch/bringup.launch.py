@@ -32,13 +32,13 @@ def _launch_setup(context, *args, **kwargs):
     imu_filter_str = LaunchConfiguration('imu_filter').perform(context)
     imu_combine_str = LaunchConfiguration('imu_combine').perform(context)
     publish_camera_mount_str = LaunchConfiguration('publish_camera_mount').perform(context)
+    mode = LaunchConfiguration('mode').perform(context)
 
     use_sim_time_bool = (source == 'rosbag')
     use_sim_time_str = 'true' if use_sim_time_bool else 'false'
 
     imu_combine_bool = imu_combine_str.lower() == 'true'
 
-    mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
     estimator_pkg = FindPackageShare('realsense_state_estimator').perform(context)
     bringup_pkg = FindPackageShare('realsense_perception_bringup').perform(context)
 
@@ -88,12 +88,32 @@ def _launch_setup(context, *args, **kwargs):
         launch_arguments={'use_sim_time': use_sim_time_str}.items(),
     ))
 
-    actions.append(IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            f'{mapper_pkg}/launch/local_elevation_mapper.launch.py'
-        ),
-        launch_arguments={'use_sim_time': use_sim_time_str}.items(),
-    ))
+    # Mapper selection. elev_map and fast_mesh share the same upstream
+    # pipeline (state_estimator, IMU, camera mount static TF). They are
+    # mutually exclusive — switching at launch time avoids running
+    # multiple mappers on the same input cloud, which would be wasteful.
+    if mode == 'elev_map':
+        mapper_pkg = FindPackageShare('realsense_elevation_mapper').perform(context)
+        actions.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                f'{mapper_pkg}/launch/local_elevation_mapper.launch.py'
+            ),
+            launch_arguments={'use_sim_time': use_sim_time_str}.items(),
+        ))
+    elif mode == 'fast_mesh':
+        mapper_pkg = FindPackageShare('realsense_fast_mesh_baseline').perform(context)
+        actions.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                f'{mapper_pkg}/launch/fast_mesh_baseline.launch.py'
+            ),
+            launch_arguments={'use_sim_time': use_sim_time_str}.items(),
+        ))
+    else:
+        # DeclareLaunchArgument(choices=...) already validates, but defend
+        # against bypass via explicit value mismatch.
+        raise RuntimeError(
+            f"mode must be 'elev_map' or 'fast_mesh', got '{mode}'."
+        )
 
     if rviz_str.lower() == 'true':
         actions.append(Node(
@@ -178,6 +198,18 @@ def generate_launch_description() -> LaunchDescription:
                 'config/camera_mount.json. Default true so a desktop D435i '
                 'test works without a URDF. Set false if your URDF / '
                 'robot_state_publisher already publishes that edge.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'mode',
+            default_value='elev_map',
+            choices=['elev_map', 'fast_mesh'],
+            description=(
+                'Which mapper to start: "elev_map" (Kalman-fused 2D '
+                'elevation grid, default) or "fast_mesh" (single-frame '
+                'PCL OrganizedFastMesh baseline with per-vertex slope '
+                'coloring). Both share the state_estimator + IMU + '
+                'camera_mount upstream pipeline; choose one per launch.'
             ),
         ),
         OpaqueFunction(function=_launch_setup),

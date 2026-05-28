@@ -1,0 +1,59 @@
+local_fast_mesh_node:
+  ros__parameters:
+    # ---- Topics ----
+    # We subscribe to the raw depth Image + CameraInfo (NOT the
+    # wrapper's PointCloud2 topic) and reconstruct the organized cloud
+    # ourselves. This bypasses the wrapper's `pointcloud.ordered_pc`
+    # flag — many bags were recorded with that false, producing a
+    # NaN-stripped / unorganized PointCloud2 that the PCL organized
+    # algorithms cannot consume.
+    depth_image_topic:       /camera/camera/depth/image_rect_raw
+    camera_info_topic:       /camera/camera/depth/camera_info
+    mesh_marker_topic:       /local_fast_mesh/mesh
+
+    # ---- Frames ----
+    # target_frame: gravity-aligned frame the mesh is published in.
+    # state_estimator publishes odom->base_link with roll/pitch from the
+    # IMU and translation=[0,0,0], so vertex z stays world-up even when
+    # the robot tilts (same convention as elev_mapper / surfel_mapper).
+    target_frame:            odom
+
+    # ---- Timing / TF ----
+    tf_timeout_sec:          0.1
+    # When true, use latest available TF instead of msg->header.stamp.
+    # Required when bag stamps and /clock are mismatched (RealSense
+    # sensor-time bags). Set to false once a time-varying estimator is
+    # in place and stamps are consistent.
+    use_latest_tf:           true
+    cloud_queue_size:        5
+
+    # ---- IntegralImageNormalEstimation ----
+    # Patch size (image pixels) over which the local plane is fitted to
+    # estimate the normal. Larger = smoother normals, less per-pixel
+    # noise, but small terrain features get washed out.
+    normal_smoothing_size:    20.0
+    # Depth discontinuity threshold (m). If |z_i - z_j| / z_i exceeds
+    # this between adjacent pixels, the normal estimator treats the edge
+    # as a discontinuity. NOTE: this assumes the cloud is in *camera*
+    # coordinates where z is the optical depth axis — that's why we run
+    # normal estimation BEFORE transforming the cloud to target_frame.
+    max_depth_change_factor:  0.02
+
+    # ---- OrganizedFastMesh ----
+    # Adjacent vertices farther than this in 3D are NOT connected into
+    # a triangle (creates a depth-jump cut, e.g. at step edges).
+    triangle_max_edge_length: 0.10
+    # Triangulation pattern. Valid:
+    #   TRIANGLE_RIGHT_CUT      (each quad cut along the "\" diagonal)
+    #   TRIANGLE_LEFT_CUT       (each quad cut along the "/" diagonal)
+    #   TRIANGLE_ADAPTIVE_CUT   (pick the diagonal that yields smaller edge)
+    #   QUAD_MESH               (output 4-vertex polygons, not triangles —
+    #                            note the Marker output is always TRIANGLE_LIST
+    #                            so QUAD_MESH is rejected at load time)
+    triangulation_type:       "TRIANGLE_ADAPTIVE_CUT"
+
+    # ---- Visualization ----
+    # Slope angle (rad) at which color ramp starts (green) and ends (red).
+    # Slope is arccos(|n . z_up|) computed in target_frame.
+    color_min_slope_rad:      0.0
+    color_max_slope_rad:      0.785   # ~45 deg
