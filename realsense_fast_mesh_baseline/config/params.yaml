@@ -27,6 +27,14 @@ local_fast_mesh_node:
     use_latest_tf:           true
     cloud_queue_size:        5
 
+    # ---- Range cutoff (spherical) ----
+    # Drop points whose distance from the camera origin (sqrt(x²+y²+z²)
+    # in the camera optical frame) exceeds max_distance_m. RealSense
+    # depth noise scales with depth², so far points are mostly noise; a
+    # spherical cutoff trims them before they cost any normal /
+    # triangulation work. Set to 0 (or negative) to disable.
+    max_distance_m:           3.5
+
     # ---- Pixel stride (cloud downsampling) ----
     # Take every Nth pixel of the depth image along both axes when
     # reconstructing the organized cloud. stride=1 keeps every pixel

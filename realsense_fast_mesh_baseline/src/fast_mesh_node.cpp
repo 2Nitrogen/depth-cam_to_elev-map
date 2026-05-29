@@ -38,6 +38,8 @@ FastMeshNode::FastMeshNode()
     const int s = declare_parameter<int>("pixel_stride", 1);
     builder_params_.pixel_stride = static_cast<std::uint32_t>(std::max(1, s));
   }
+  builder_params_.max_distance_m =
+    static_cast<float>(declare_parameter<double>("max_distance_m", 3.5));
   builder_params_.normal_smoothing_size =
     static_cast<float>(declare_parameter<double>("normal_smoothing_size", 20.0));
   builder_params_.max_depth_change_factor =
@@ -87,12 +89,14 @@ FastMeshNode::FastMeshNode()
 
   RCLCPP_INFO(get_logger(),
     "Subscribed to depth=%s + camera_info=%s -> target_frame=%s "
-    "pixel_stride=%u normal_smoothing=%.2fpx max_depth_change=%.4f "
-    "triangle_max_edge=%.3fm triangulation=%s color_slope=[%.3f..%.3f]rad "
-    "point_size=%.3fm face_alpha=%.2f edge_width=%.4fm edge_alpha=%.2f",
+    "pixel_stride=%u max_distance=%.2fm normal_smoothing=%.2fpx "
+    "max_depth_change=%.4f triangle_max_edge=%.3fm triangulation=%s "
+    "color_slope=[%.3f..%.3f]rad point_size=%.3fm face_alpha=%.2f "
+    "edge_width=%.4fm edge_alpha=%.2f",
     depth_image_topic_.c_str(), camera_info_topic_.c_str(),
     target_frame_.c_str(),
     builder_params_.pixel_stride,
+    builder_params_.max_distance_m,
     builder_params_.normal_smoothing_size,
     builder_params_.max_depth_change_factor,
     builder_params_.triangle_max_edge_length,

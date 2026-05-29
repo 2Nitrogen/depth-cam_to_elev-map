@@ -55,6 +55,15 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr build_organized_cloud_from_depth(
     return cloud;
   }
 
+  // Precompute the squared max-distance for the spherical cutoff so the
+  // per-pixel test is a multiplication + comparison (no sqrt). When the
+  // cutoff is disabled (<= 0), set the threshold to +inf so no point
+  // ever exceeds it.
+  const float max_distance_sq =
+    (params.max_distance_m > 0.0f)
+      ? params.max_distance_m * params.max_distance_m
+      : std::numeric_limits<float>::infinity();
+
   const std::string & enc = depth_image.encoding;
   using namespace sensor_msgs::image_encodings;
 
@@ -76,6 +85,12 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr build_organized_cloud_from_depth(
           pt.x = (static_cast<float>(u_orig) - cx) * d / fx;
           pt.y = (static_cast<float>(v_orig) - cy) * d / fy;
           pt.z = d;
+          // Spherical range cutoff: drop points outside sqrt(x²+y²+z²)
+          // > max_distance_m. Squared comparison avoids the sqrt.
+          const float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+          if (dist_sq > max_distance_sq) {
+            pt.x = nan; pt.y = nan; pt.z = nan;
+          }
         }
         pt.data[3] = 1.0f;  // SSE alignment field — some PCL kernels read it
       }
@@ -97,6 +112,11 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr build_organized_cloud_from_depth(
           pt.x = (static_cast<float>(u_orig) - cx) * d / fx;
           pt.y = (static_cast<float>(v_orig) - cy) * d / fy;
           pt.z = d;
+          // Spherical range cutoff (see 16UC1 branch for rationale).
+          const float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+          if (dist_sq > max_distance_sq) {
+            pt.x = nan; pt.y = nan; pt.z = nan;
+          }
         }
         pt.data[3] = 1.0f;  // SSE alignment field — some PCL kernels read it
       }

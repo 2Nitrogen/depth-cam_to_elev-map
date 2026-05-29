@@ -68,6 +68,15 @@ struct MeshBuilderParams
   // remains geometrically correct regardless of stride.
   std::uint32_t pixel_stride{1u};
 
+  // Spherical distance cutoff from the camera center, in meters.
+  // Points with sqrt(x²+y²+z²) > max_distance_m (computed in camera
+  // optical frame, where the camera is at the origin) are set to NaN
+  // when the cloud is built. Normal estimation and OrganizedFastMesh
+  // both treat NaN points as missing, so far points naturally disappear
+  // from the output mesh without any extra plumbing. Set to 0 or
+  // negative to disable the cutoff.
+  float max_distance_m{3.5f};
+
   // Per-pixel cross-product normal estimation.
   //   normal_smoothing_size  : gradient sample step in cloud-grid pixels
   //                            (1 = raw per-pixel, larger = smoother /
