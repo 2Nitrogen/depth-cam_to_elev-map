@@ -82,30 +82,14 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   track_point_frame_ = declare_parameter<std::string>("track_point_frame", "base_link");
   k_frames_          = declare_parameter<int>("k_frames", 5);
 
-  // map_length_x / map_length_y are kept in the yaml for documentation but the
-  // grid is sized from x_max-x_min / y_max-y_min — declare them so loading the
-  // yaml doesn't warn.
-  declare_parameter<double>("map_length_x", 2.0);
-  declare_parameter<double>("map_length_y", 2.0);
-
   resolution_ = declare_parameter<double>("resolution", 0.02);
 
-  // ROI bounds: NaN default is a sentinel for "not provided in YAML".
-  // When all six are finite, ROI crop is enabled and the grid extent is
-  // fixed; when ANY is missing, we fall back to inspection mode (no crop,
-  // grid auto-fits to the accumulated cloud's actual XY extent each frame).
-  const double kNaN = std::numeric_limits<double>::quiet_NaN();
-  x_min_ = declare_parameter<double>("x_min", kNaN);
-  x_max_ = declare_parameter<double>("x_max", kNaN);
-  y_min_ = declare_parameter<double>("y_min", kNaN);
-  y_max_ = declare_parameter<double>("y_max", kNaN);
-  z_min_ = declare_parameter<double>("z_min", kNaN);
-  z_max_ = declare_parameter<double>("z_max", kNaN);
-
-  roi_set_ =
-    std::isfinite(x_min_) && std::isfinite(x_max_) &&
-    std::isfinite(y_min_) && std::isfinite(y_max_) &&
-    std::isfinite(z_min_) && std::isfinite(z_max_);
+  // Spherical cutoff (m) applied to the raw camera-frame cloud. > 0
+  // enables sphere crop + a fixed grid extent of [-R, R]×[-R, R]
+  // shifted by the track-point translation. <= 0 disables the cull
+  // and falls back to inspection mode (grid auto-fits each frame).
+  max_distance_m_ = declare_parameter<double>("max_distance_m", 3.5);
+  cull_active_ = max_distance_m_ > 0.0;
 
   publish_accumulated_cloud_ = declare_parameter<bool>("publish_accumulated_cloud", true);
   publish_elevation_cloud_   = declare_parameter<bool>("publish_elevation_cloud", true);
@@ -162,23 +146,27 @@ LocalElevationMapperNode::LocalElevationMapperNode()
   pub_accum_ = create_publisher<sensor_msgs::msg::PointCloud2>(accumulated_cloud_topic_, 1);
   pub_elev_  = create_publisher<sensor_msgs::msg::PointCloud2>(elevation_cloud_topic_, 1);
 
-  if (roi_set_) {
+  if (cull_active_) {
     // Compute the initial grid spec just for the startup log. The runtime
-    // fusion path builds its own frame_spec per callback (track-point
-    // shifted in motion mode).
-    const auto initial_spec =
-      make_grid_spec(x_min_, x_max_, y_min_, y_max_, resolution_);
+    // fusion path builds its own frame_spec per callback (shifted by
+    // the track-point translation).
+    const auto initial_spec = make_grid_spec(
+      -max_distance_m_, max_distance_m_,
+      -max_distance_m_, max_distance_m_,
+      resolution_);
     RCLCPP_INFO(get_logger(),
-      "Subscribed to %s -> target_frame=%s grid=%zux%zu@%.3fm k_frames=%d (ROI crop on)",
+      "Subscribed to %s -> target_frame=%s max_distance=%.2fm "
+      "grid=%zux%zu@%.3fm k_frames=%d (sphere crop on)",
       input_cloud_topic_.c_str(), target_frame_.c_str(),
+      max_distance_m_,
       initial_spec.size_x, initial_spec.size_y, resolution_, k_frames_);
   } else {
     RCLCPP_WARN(get_logger(),
       "Subscribed to %s -> target_frame=%s resolution=%.3fm k_frames=%d. "
-      "INSPECTION MODE: not all of x_min/x_max/y_min/y_max/z_min/z_max are "
-      "set in YAML, so ROI crop is disabled and the elevation grid extent "
-      "auto-fits to the accumulated cloud each frame. Provide all six "
-      "bounds in YAML for production.",
+      "INSPECTION MODE: max_distance_m <= 0 in YAML, so sphere crop is "
+      "disabled and the elevation grid extent auto-fits to the "
+      "accumulated cloud each frame. Set max_distance_m > 0 in YAML "
+      "for production.",
       input_cloud_topic_.c_str(), target_frame_.c_str(),
       resolution_, k_frames_);
   }
@@ -244,16 +232,25 @@ void LocalElevationMapperNode::on_cloud(
   std::vector<int> nan_indices;
   pcl::removeNaNFromPointCloud(*raw, *raw, nan_indices);
 
+  // Spherical range cutoff in CAMERA frame (sensor-centered ball). σ_z
+  // of RGB-D depth scales with z², so far points are mostly noise; we
+  // trim them at the natural cutoff before they cost any TF transform
+  // or fusion work. No-op when max_distance_m_ <= 0 (inspection mode).
+  crop_sphere(*raw, static_cast<float>(max_distance_m_));
+  if (raw->empty()) {
+    return;
+  }
+
   // Transform into the configured target frame using the TF we just looked up.
   const Eigen::Isometry3d transform_d = tf2::transformToEigen(tf_msg.transform);
   const Eigen::Affine3f transform_f(transform_d.cast<float>());
   auto transformed = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::transformPointCloud(*raw, *transformed, transform_f);
 
-  // Look up the track point's XY in target_frame so the ROI / grid window
-  // can follow the robot. With state_estimator forcing translation=0 this
-  // is currently always (0,0,0) — but the lookup keeps the code ready for
-  // when real odometry comes in.
+  // Look up the track point's XY in target_frame so the grid window can
+  // follow the robot. With state_estimator forcing translation=0 this
+  // is currently always (0,0,0) — but the lookup keeps the code ready
+  // for when real odometry comes in.
   double tp_dx = 0.0, tp_dy = 0.0;
   if (track_point_frame_ != target_frame_) {
     try {
@@ -273,8 +270,10 @@ void LocalElevationMapperNode::on_cloud(
   // Build per-point HeightMeasurements.
   //   raw[i] feeds R = compute_measurement_variance(...).
   //   transformed[i] gives target-frame xyz used for cell binning + fusion.
-  //   removeNaN was done in-place on raw, then transformPointCloud preserves
-  //   ordering, so raw[i] / transformed[i] always correspond.
+  //   removeNaN + crop_sphere were done in-place on raw before transform,
+  //   and transformPointCloud preserves ordering, so raw[i] /
+  //   transformed[i] always correspond. No further crop is needed — the
+  //   sphere cull already trimmed far / NaN points.
   // ---------------------------------------------------------------------
   std::vector<HeightMeasurement> measurements;
   measurements.reserve(transformed->size());
@@ -287,30 +286,23 @@ void LocalElevationMapperNode::on_cloud(
     });
   }
 
-  if (roi_set_) {
-    crop_measurements_roi(measurements,
-      static_cast<float>(x_min_ + tp_dx), static_cast<float>(x_max_ + tp_dx),
-      static_cast<float>(y_min_ + tp_dy), static_cast<float>(y_max_ + tp_dy),
-      static_cast<float>(z_min_),        static_cast<float>(z_max_));
-  }
-
   // ---------------------------------------------------------------------
   // Pick this frame's grid spec.
-  //   ROI mode      : configured bounds shifted by the track-point
-  //                   translation (ego-centric in motion mode, identical
-  //                   to configured bounds when translation = 0).
-  //   Inspection    : auto-fit to this frame's measurement extent so every
-  //                   valid point lands in some cell.
+  //   sphere-crop mode : grid extent = [-R, R] × [-R, R] shifted by the
+  //                      track-point translation (ego-centric in motion
+  //                      mode, identical to [-R, R] when translation=0).
+  //   Inspection       : auto-fit to this frame's measurement extent so
+  //                      every valid point lands in some cell.
   // The bin stage uses this spec. The fusion stage will use a freshly
   // computed spec too — CellMeasurement stores world-frame cell centres,
   // so the two specs do not need to match (matters in inspection mode
   // where the auto-fit can drift frame to frame).
   // ---------------------------------------------------------------------
   GridSpec frame_spec;
-  if (roi_set_) {
+  if (cull_active_) {
     frame_spec = make_grid_spec(
-      x_min_ + tp_dx, x_max_ + tp_dx,
-      y_min_ + tp_dy, y_max_ + tp_dy,
+      -max_distance_m_ + tp_dx, max_distance_m_ + tp_dx,
+      -max_distance_m_ + tp_dy, max_distance_m_ + tp_dy,
       resolution_);
   } else if (!measurements.empty()) {
     float min_x = std::numeric_limits<float>::infinity();

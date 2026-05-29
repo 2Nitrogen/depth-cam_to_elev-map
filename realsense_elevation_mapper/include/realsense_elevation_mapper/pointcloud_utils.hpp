@@ -1,31 +1,25 @@
 #pragma once
 
-#include <vector>
-
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-
-#include "realsense_elevation_mapper/elevation_grid.hpp"
 
 namespace realsense_elevation_mapper
 {
 
-// In-place ROI crop: keep only points strictly inside the half-open box
-// [x_min, x_max) x [y_min, y_max) x [z_min, z_max). Matches the Python
-// crop_roi semantics.
-void crop_roi(
+// In-place spherical cutoff: drop points whose distance from the
+// origin (sqrt(x² + y² + z²)) exceeds `max_distance`. Designed to be
+// called on the cloud in CAMERA optical frame (where the camera is at
+// the origin), so the cutoff is a sphere centered on the sensor — the
+// natural "depth-aware" trim for RGB-D data, since RealSense depth
+// noise scales with depth².
+//
+// NaN / non-finite points are also dropped (defensive — the caller may
+// have already filtered NaN via pcl::removeNaNFromPointCloud).
+//
+// If `max_distance` <= 0 the cutoff is disabled (no-op). After the
+// call the cloud is unorganized (height = 1) and dense (is_dense = true).
+void crop_sphere(
   pcl::PointCloud<pcl::PointXYZ> & cloud,
-  float x_min, float x_max,
-  float y_min, float y_max,
-  float z_min, float z_max);
-
-// Same half-open box but for HeightMeasurement vectors (in-place). Used
-// after we've already bundled raw-derived variance into the measurements,
-// so we don't accidentally desynchronize a parallel variance vector.
-void crop_measurements_roi(
-  std::vector<HeightMeasurement> & measurements,
-  float x_min, float x_max,
-  float y_min, float y_max,
-  float z_min, float z_max);
+  float max_distance);
 
 }  // namespace realsense_elevation_mapper

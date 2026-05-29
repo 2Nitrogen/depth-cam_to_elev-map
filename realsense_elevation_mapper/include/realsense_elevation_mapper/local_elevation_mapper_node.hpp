@@ -29,10 +29,14 @@ namespace realsense_elevation_mapper
 //   tf'd : pcl::PointCloud<PointXYZ>   M, frame = target_frame (default odom,
 //                                      gravity-aligned per REP-103). Same
 //                                      ordering as raw — index pairs line up.
+//   crop : raw cloud is sphere-cropped (camera-origin || p || <=
+//          max_distance_m) BEFORE the transform. This trims far noisy
+//          depth (σ_z ∝ z²) at the natural cutoff for an RGB-D sensor.
+//          With max_distance_m <= 0 the cropping is skipped and the
+//          mapper falls back to inspection mode (grid auto-fits each
+//          frame).
 //   meas : std::vector<HeightMeasurement>  M, bundles target-frame (x,y,z)
 //                                      with R = compute_measurement_variance(raw[i]).
-//   crop : same M' <= M, applied only when all six ROI bounds are
-//          provided in YAML (otherwise inspection mode -> no crop).
 //
 //   ❶ bin   : std::vector<CellMeasurement>  K <= M', one entry per occupied
 //             cell in the frame. (x_center, y_center) world coords + mean z
@@ -55,22 +59,24 @@ namespace realsense_elevation_mapper
 //                       (default `odom`). Elevation z and the XY grid plane
 //                       are expressed in this frame.
 //   track_point_frame : the body frame the local map window follows
-//                       (default `base_link`). When ROI bounds are set, they
-//                       are interpreted as offsets relative to this frame's
-//                       XY position in target_frame. Today translation is
-//                       forced to zero by the state estimator, so the
-//                       effective bounds equal the configured ones; once
-//                       real odometry comes in, the window will follow the
-//                       robot automatically.
+//                       (default `base_link`). The grid window is
+//                       [-R, R]×[-R, R] in target_frame, *centered* on
+//                       this frame's XY position (R = max_distance_m).
+//                       Today translation is forced to zero by the state
+//                       estimator, so the window is centered on the
+//                       origin; once real odometry comes in, the window
+//                       will follow the robot automatically.
 //
-// ROI / grid mode (chosen once at construction):
-//   * roi_set_ == true : ROI crop active. Grid extent each callback =
-//                        configured bounds shifted by the current
-//                        target_frame -> track_point_frame translation.
-//   * roi_set_ == false: inspection mode, no crop, grid extent rebuilt
-//                        each frame from the accumulated cloud's actual
-//                        XY extent so that every valid depth point shows
-//                        up in the elevation cloud.
+// Sphere cull / grid mode (chosen once at construction):
+//   * cull_active_ == true  (max_distance_m_ > 0):
+//        raw cloud is sphere-cropped to the sensor-centered ball of
+//        radius max_distance_m_ BEFORE transform. Grid extent each
+//        callback = [-R, R]×[-R, R] shifted by the track-point
+//        translation.
+//   * cull_active_ == false (max_distance_m_ <= 0):
+//        inspection mode — no crop, grid extent rebuilt each frame
+//        from the accumulated cloud's actual XY extent so every valid
+//        depth point shows up in the elevation cloud.
 class LocalElevationMapperNode : public rclcpp::Node
 {
 public:
@@ -87,20 +93,15 @@ private:
   std::string track_point_frame_;  // body frame the window follows
   int k_frames_{5};
 
-  // ROI bounds. NaN sentinel means "not provided in YAML" -> inspection
-  // mode (see class comment).
-  double x_min_{std::numeric_limits<double>::quiet_NaN()};
-  double x_max_{std::numeric_limits<double>::quiet_NaN()};
-  double y_min_{std::numeric_limits<double>::quiet_NaN()};
-  double y_max_{std::numeric_limits<double>::quiet_NaN()};
-  double z_min_{std::numeric_limits<double>::quiet_NaN()};
-  double z_max_{std::numeric_limits<double>::quiet_NaN()};
+  // Spherical cutoff radius (m) applied to the raw camera-frame cloud.
+  // <= 0 means cutoff disabled → inspection mode (see class comment).
+  double max_distance_m_{3.5};
   double resolution_{0.02};
 
   bool publish_accumulated_cloud_{true};
   bool publish_elevation_cloud_{true};
-  // Derived at construction: true iff all six ROI bounds are finite.
-  bool roi_set_{false};
+  // Derived at construction: true iff max_distance_m_ > 0.
+  bool cull_active_{true};
   int min_points_per_cell_{1};
   int cloud_queue_size_{5};
   double tf_timeout_sec_{0.1};
