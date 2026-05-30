@@ -49,6 +49,16 @@ FastMeshNode::FastMeshNode()
   builder_params_.triangulation_type = parse_triangulation_type(
     declare_parameter<std::string>("triangulation_type", "TRIANGLE_ADAPTIVE_CUT"));
 
+  // Face-normal Laplacian smoothing. iterations clamped to >=0;
+  // self_weight clamped on use (smooth_face_normals does this).
+  {
+    const int it = declare_parameter<int>("normal_smoothing_iterations", 1);
+    builder_params_.normal_smoothing_iterations =
+      static_cast<std::uint32_t>(std::max(0, it));
+  }
+  builder_params_.normal_smoothing_self_weight =
+    static_cast<float>(declare_parameter<double>("normal_smoothing_self_weight", 0.5));
+
   marker_style_.color_min_slope_rad =
     declare_parameter<double>("color_min_slope_rad", 0.0);
   marker_style_.color_max_slope_rad =
@@ -86,7 +96,8 @@ FastMeshNode::FastMeshNode()
   RCLCPP_INFO(get_logger(),
     "Subscribed to depth=%s + camera_info=%s -> target_frame=%s "
     "pixel_stride=%u max_distance=%.2fm triangle_max_edge=%.3fm "
-    "triangulation=%s color_slope=[%.3f..%.3f]rad point_size=%.3fm "
+    "triangulation=%s smoothing=%u iter alpha=%.2f "
+    "color_slope=[%.3f..%.3f]rad point_size=%.3fm "
     "face_alpha=%.2f edge_width=%.4fm edge_alpha=%.2f",
     depth_image_topic_.c_str(), camera_info_topic_.c_str(),
     target_frame_.c_str(),
@@ -94,6 +105,8 @@ FastMeshNode::FastMeshNode()
     builder_params_.max_distance_m,
     builder_params_.triangle_max_edge_length,
     triangulation_type_str(builder_params_.triangulation_type),
+    builder_params_.normal_smoothing_iterations,
+    builder_params_.normal_smoothing_self_weight,
     marker_style_.color_min_slope_rad,
     marker_style_.color_max_slope_rad,
     marker_style_.point_size_m,
@@ -175,8 +188,24 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   RCLCPP_INFO_ONCE(get_logger(),
     "[4/5] Mesh built: %zu polygons", mesh.polygons.size());
 
-  // ---- Per-face normals (in target frame, since mesh is in target frame) ----
-  const std::vector<Eigen::Vector3f> face_normals = compute_face_normals(mesh);
+  // ---- Per-face normals (raw, from triangle vertices) ----
+  const std::vector<Eigen::Vector3f> raw_face_normals = compute_face_normals(mesh);
+
+  // ---- Laplacian smoothing on the face graph (skipped when iter=0) ----
+  // Build the face adjacency once and reuse for smoothing. Mesh is
+  // already cut at depth discontinuities by OrganizedFastMesh, so the
+  // graph naturally splits at step edges — smoothing won't bleed
+  // across them.
+  std::vector<Eigen::Vector3f> face_normals;
+  if (builder_params_.normal_smoothing_iterations > 0u) {
+    const auto adjacency = compute_face_adjacency(mesh);
+    face_normals = smooth_face_normals(
+      raw_face_normals, adjacency,
+      builder_params_.normal_smoothing_iterations,
+      builder_params_.normal_smoothing_self_weight);
+  } else {
+    face_normals = raw_face_normals;
+  }
 
   // ---- Serialize to MarkerArray + publish ----
   auto marker_array = mesh_to_marker_array(

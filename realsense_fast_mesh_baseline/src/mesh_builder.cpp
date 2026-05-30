@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
 
 #include <pcl/conversions.h>
 #include <pcl/surface/organized_fast_mesh.h>
@@ -229,6 +231,124 @@ std::vector<Eigen::Vector3f> compute_face_normals(const pcl::PolygonMesh & mesh)
   }
 
   return normals;
+}
+
+std::vector<std::vector<int>> compute_face_adjacency(const pcl::PolygonMesh & mesh)
+{
+  const std::size_t n_polys = mesh.polygons.size();
+  std::vector<std::vector<int>> adjacency(n_polys);
+
+  // Hash an undirected edge as a single uint64 with the smaller vertex
+  // index in the low 32 bits. Reserve a generous bucket count — typical
+  // mesh has ~3 edges per face, so ~3 * n_polys keys.
+  std::unordered_map<std::uint64_t, int> seen_edges;
+  seen_edges.reserve(n_polys * 3);
+
+  auto edge_key = [](std::uint32_t a, std::uint32_t b) -> std::uint64_t {
+    if (a > b) {
+      std::swap(a, b);
+    }
+    return (static_cast<std::uint64_t>(a) << 32) |
+           static_cast<std::uint64_t>(b);
+  };
+
+  auto register_edge = [&](int face_idx, std::uint32_t va, std::uint32_t vb) {
+    const std::uint64_t key = edge_key(va, vb);
+    const auto it = seen_edges.find(key);
+    if (it == seen_edges.end()) {
+      seen_edges.emplace(key, face_idx);
+    } else {
+      // Pair the two faces that share this edge.
+      const int other = it->second;
+      adjacency[face_idx].push_back(other);
+      adjacency[other].push_back(face_idx);
+      // The edge is now matched — drop it. A 3rd face touching the same
+      // edge would create non-manifold geometry; we ignore that case
+      // (OrganizedFastMesh on a 2D grid never produces it anyway).
+      seen_edges.erase(it);
+    }
+  };
+
+  for (std::size_t i = 0; i < n_polys; ++i) {
+    const auto & poly = mesh.polygons[i];
+    if (poly.vertices.size() != 3) {
+      continue;
+    }
+    const std::uint32_t a = poly.vertices[0];
+    const std::uint32_t b = poly.vertices[1];
+    const std::uint32_t c = poly.vertices[2];
+    register_edge(static_cast<int>(i), a, b);
+    register_edge(static_cast<int>(i), b, c);
+    register_edge(static_cast<int>(i), c, a);
+  }
+
+  return adjacency;
+}
+
+std::vector<Eigen::Vector3f> smooth_face_normals(
+  const std::vector<Eigen::Vector3f> & face_normals,
+  const std::vector<std::vector<int>> & adjacency,
+  std::uint32_t iterations,
+  float self_weight)
+{
+  std::vector<Eigen::Vector3f> current = face_normals;
+  if (iterations == 0u || adjacency.empty()) {
+    return current;
+  }
+
+  // Clamp the self-weight to a sane range.
+  const float alpha = std::max(0.0f, std::min(1.0f, self_weight));
+  const float one_minus_alpha = 1.0f - alpha;
+
+  std::vector<Eigen::Vector3f> next(current.size());
+
+  for (std::uint32_t k = 0; k < iterations; ++k) {
+    for (std::size_t i = 0; i < current.size(); ++i) {
+      // Faces that are themselves NaN stay NaN — smoothing won't
+      // resurrect them.
+      if (!current[i].allFinite()) {
+        next[i] = current[i];
+        continue;
+      }
+
+      // Average the FINITE neighbors.
+      const auto & nbrs = (i < adjacency.size()) ? adjacency[i] : std::vector<int>{};
+      Eigen::Vector3f nbr_sum = Eigen::Vector3f::Zero();
+      int nbr_count = 0;
+      for (const int j : nbrs) {
+        if (j < 0 || static_cast<std::size_t>(j) >= current.size()) {
+          continue;
+        }
+        const Eigen::Vector3f & nj = current[j];
+        if (!nj.allFinite()) {
+          continue;
+        }
+        nbr_sum += nj;
+        ++nbr_count;
+      }
+
+      Eigen::Vector3f blended;
+      if (nbr_count == 0) {
+        // Isolated face (or surrounded by NaN neighbors): nothing to
+        // smooth against, keep self.
+        blended = current[i];
+      } else {
+        blended = alpha * current[i] +
+                  one_minus_alpha * (nbr_sum / static_cast<float>(nbr_count));
+      }
+
+      const float mag = blended.norm();
+      if (mag > 0.0f) {
+        next[i] = blended / mag;
+      } else {
+        // Degenerate cancellation — keep the previous step's value.
+        next[i] = current[i];
+      }
+    }
+    current.swap(next);
+  }
+
+  return current;
 }
 
 }  // namespace realsense_fast_mesh_baseline

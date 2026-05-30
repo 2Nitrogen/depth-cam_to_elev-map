@@ -89,6 +89,15 @@ struct MeshBuilderParams
   //                             rationale.
   float             triangle_max_edge_length{kBaseEdgeLengthPerStride};
   TriangulationType triangulation_type{TriangulationType::TriangleAdaptiveCut};
+
+  // Face-normal Laplacian smoothing on the mesh face graph (see
+  // smooth_face_normals below). Operates AFTER compute_face_normals.
+  //   normal_smoothing_iterations  : 0 disables; 1-2 typical.
+  //   normal_smoothing_self_weight : α ∈ [0, 1]. 1 = keep self only
+  //                                  (effectively K=0); 0 = pure
+  //                                  neighbor average.
+  std::uint32_t normal_smoothing_iterations{1u};
+  float         normal_smoothing_self_weight{0.5f};
 };
 
 // Build an organized pcl::PointCloud<PointXYZ> directly from a depth
@@ -133,6 +142,40 @@ pcl::PolygonMesh build_fast_mesh(
 // frame cloud, the returned normals are in target_frame as well —
 // slope angle = arccos(|n_z|) is then directly meaningful.
 std::vector<Eigen::Vector3f> compute_face_normals(const pcl::PolygonMesh & mesh);
+
+// Build a per-face 1-ring adjacency list: adjacency[i] = list of face
+// indices that share an edge with face i. Computed edge-based (two
+// faces are neighbors iff they share exactly the same vertex-index
+// pair), so it does NOT depend on OrganizedFastMesh's internal cell
+// layout. O(F) expected time using a hash map keyed on the canonical
+// (min_vertex_idx, max_vertex_idx) edge.
+//
+// Note on edge-preserving behavior downstream: OrganizedFastMesh
+// already drops triangles whose 3D edges exceed triangle_max_edge_length
+// (e.g. step edges / depth discontinuities), so the resulting mesh is
+// naturally cut into connected components at those boundaries. The
+// adjacency graph inherits that property — neighbors only exist within
+// a connected surface region — which makes Laplacian smoothing on this
+// graph edge-preserving by construction.
+std::vector<std::vector<int>> compute_face_adjacency(const pcl::PolygonMesh & mesh);
+
+// Laplacian smoothing of face normals on the supplied adjacency graph.
+// For each of K = `iterations` iterations, replace every face's normal
+// with:
+//     n_i' = normalize( α · n_i + (1-α) · mean_{j ∈ N(i)} n_j )
+// where the neighbor mean ignores NaN normals. If face i itself has a
+// NaN normal, it stays NaN. Returns a new vector (does not mutate the
+// input — avoids in-place same-iteration cross-talk between sibling
+// faces).
+//
+// iterations = 0 returns a copy of `face_normals` unchanged. Typical
+// values: 1-2 for visible noise reduction without over-smoothing small
+// features.
+std::vector<Eigen::Vector3f> smooth_face_normals(
+  const std::vector<Eigen::Vector3f> & face_normals,
+  const std::vector<std::vector<int>> & adjacency,
+  std::uint32_t iterations,
+  float self_weight);
 
 }  // namespace realsense_fast_mesh_baseline
 

@@ -47,12 +47,28 @@ local_fast_mesh_node:
     # below may need to scale roughly linearly with stride.
     pixel_stride:             10
 
-    # ---- OrganizedFastMesh ----
+    # ---- OrganizedFastMesh + post-mesh normal smoothing ----
     # Normals are NOT computed per-pixel anymore — one face normal is
     # derived from each triangle's vertices AFTER mesh build (see
-    # compute_face_normals in mesh_builder.cpp). Noise robustness comes
-    # from pixel_stride: larger stride = wider 3D triangle baseline =
-    # less per-vertex sensor-noise sensitivity per face normal.
+    # compute_face_normals in mesh_builder.cpp). Coarse noise robustness
+    # comes from pixel_stride: larger stride = wider 3D triangle
+    # baseline = less per-vertex sensor-noise sensitivity per face
+    # normal.
+    #
+    # Fine noise robustness comes from a Laplacian smoothing pass on
+    # the face graph (see smooth_face_normals). Each iteration replaces
+    # every face's normal with a weighted average of itself and its
+    # 1-ring neighbors (faces sharing an edge):
+    #   n_i' = normalize( alpha * n_i + (1 - alpha) * mean(n_j ∈ N(i)) )
+    # OrganizedFastMesh already cuts the mesh at depth discontinuities
+    # (triangle_max_edge_length), so the graph is naturally
+    # edge-preserving — smoothing does NOT propagate across step edges
+    # / wall corners. Within a continuous surface, adjacent faces' raw
+    # normals get pulled toward each other, which means "any single
+    # face's slope" becomes a stable estimate (good for foothold-style
+    # downstream queries).
+    normal_smoothing_iterations:  2     # 0 = off; 1-2 typical; >3 may over-smooth small features
+    normal_smoothing_self_weight: 0.5   # 1.0 = no effect (keep self); 0.0 = pure neighbor average
     # Note: triangle_max_edge_length is NOT exposed here. The node
     # computes it at runtime as `pixel_stride * 0.10 m` so the
     # depth-discontinuity threshold scales naturally with vertex
