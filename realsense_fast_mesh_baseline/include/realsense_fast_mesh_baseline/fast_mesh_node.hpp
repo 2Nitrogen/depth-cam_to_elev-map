@@ -14,13 +14,12 @@
 //
 //   1. ingest depth Image + cached CameraInfo, build organized
 //      PointCloud<PointXYZ> in camera (optical) frame.
-//   2. estimate per-pixel normals in camera frame
-//      (IntegralImageNormalEstimation needs z = depth axis).
-//   3. TF lookup target ← cam (frame from depth image header).
-//   4. transform cloud + rotate normals into target_frame.
-//   5. OrganizedFastMesh → triangle mesh in target frame.
-//   6. serialize to visualization_msgs/Marker (TRIANGLE_LIST) with
-//      per-vertex slope coloring.
+//   2. TF lookup target ← cam (frame from depth image header).
+//   3. transform cloud into target_frame.
+//   4. OrganizedFastMesh → triangle mesh in target frame.
+//   5. compute one normal per triangle (cross product of triangle
+//      vertices), then serialize mesh + face normals to a
+//      MarkerArray (POINTS + TRIANGLE_LIST + LINE_LIST) for RViz.
 
 #ifndef REALSENSE_FAST_MESH_BASELINE__FAST_MESH_NODE_HPP_
 #define REALSENSE_FAST_MESH_BASELINE__FAST_MESH_NODE_HPP_

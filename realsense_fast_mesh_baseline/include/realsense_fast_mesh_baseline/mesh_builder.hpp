@@ -1,24 +1,28 @@
-// Thin ROS-free wrappers over PCL's IntegralImageNormalEstimation and
-// OrganizedFastMesh. Both require organized point clouds (height > 1,
-// width = depth-image columns); the caller is responsible for handing
-// the cloud in WITHOUT removing NaN entries (which would destroy the
-// organized structure both algorithms depend on).
+// Thin ROS-free wrappers around the fast-mesh pipeline:
+//   build_organized_cloud_from_depth : depth Image + CameraInfo → cloud
+//   build_fast_mesh                  : OrganizedFastMesh triangulation
+//   compute_face_normals             : per-triangle normal (post-mesh)
 //
-// Coordinate-system note: IntegralImageNormalEstimation interprets the
-// cloud's z axis as the optical depth direction for its discontinuity
-// test (max_depth_change_factor). Therefore the normal estimation must
-// run on the cloud BEFORE any TF rotation that moves z away from the
-// optical axis. OrganizedFastMesh has no such assumption (its only 3D
-// check is the max_edge_length cap), so the triangulation may run on
-// either the camera-frame or the target-frame cloud — the choice here
-// is to run it on the target-frame cloud so that mesh.cloud is already
-// in publish coordinates.
+// Operates on organized point clouds (height > 1, width = depth-image
+// columns / stride); the caller is responsible for handing the cloud in
+// WITHOUT removing NaN entries — OrganizedFastMesh needs the organized
+// grid structure to know which 2×2 cells to try emitting triangles for,
+// and NaN corners simply suppress their incident triangles.
+//
+// Coordinate-system note: face normals are computed in whatever frame
+// the input mesh is built in. Since the node builds the mesh on the
+// already-transformed (target-frame) cloud, the resulting face normals
+// are in target_frame and can be used directly for slope coloring
+// (slope = arccos(|n_z|)).
 
 #ifndef REALSENSE_FAST_MESH_BASELINE__MESH_BUILDER_HPP_
 #define REALSENSE_FAST_MESH_BASELINE__MESH_BUILDER_HPP_
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+#include <Eigen/Core>
 
 #include <pcl/PolygonMesh.h>
 #include <pcl/point_cloud.h>
@@ -71,22 +75,10 @@ struct MeshBuilderParams
   // Spherical distance cutoff from the camera center, in meters.
   // Points with sqrt(x²+y²+z²) > max_distance_m (computed in camera
   // optical frame, where the camera is at the origin) are set to NaN
-  // when the cloud is built. Normal estimation and OrganizedFastMesh
-  // both treat NaN points as missing, so far points naturally disappear
-  // from the output mesh without any extra plumbing. Set to 0 or
-  // negative to disable the cutoff.
+  // when the cloud is built. OrganizedFastMesh treats NaN points as
+  // missing, so far points naturally disappear from the output mesh
+  // without any extra plumbing. Set to 0 or negative to disable.
   float max_distance_m{3.5f};
-
-  // Per-pixel cross-product normal estimation.
-  //   normal_smoothing_size  : gradient sample step in cloud-grid pixels
-  //                            (1 = raw per-pixel, larger = smoother /
-  //                            less sensor-noise sensitive). Note this
-  //                            is in DOWNSAMPLED grid units when
-  //                            pixel_stride > 1.
-  //   max_depth_change_factor: relative depth-jump threshold for
-  //                            discontinuity rejection (0 disables).
-  float normal_smoothing_size{20.0f};
-  float max_depth_change_factor{0.02f};
 
   // OrganizedFastMesh
   //   triangle_max_edge_length: maximum 3D edge length (m) for an
@@ -122,19 +114,25 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr build_organized_cloud_from_depth(
   const sensor_msgs::msg::CameraInfo & camera_info,
   const MeshBuilderParams & params);
 
-// Estimate per-pixel normals on an organized cloud via cross product
-// of (right - center) × (down - center). NaN-aware: any pixel whose
-// 3-sample window has an invalid point or fails the discontinuity test
-// is left as NaN. Output cloud has the same width/height as input.
-pcl::PointCloud<pcl::Normal>::Ptr estimate_normals(
-  const pcl::PointCloud<pcl::PointXYZ>::ConstPtr & cloud,
-  const MeshBuilderParams & params);
-
 // Run OrganizedFastMesh on an organized cloud. Coordinate system is
 // not constrained — the only 3D operation is the max_edge_length check.
 pcl::PolygonMesh build_fast_mesh(
   const pcl::PointCloud<pcl::PointXYZ>::ConstPtr & cloud,
   const MeshBuilderParams & params);
+
+// Compute one unit normal per triangle in `mesh`:
+//     n_f = normalize((b - a) × (c - a))
+// for triangle (a, b, c) where indices reference mesh.cloud. The output
+// vector has the same length and order as mesh.polygons, so caller-side
+// iteration over polygons can index face_normals[i] directly.
+//
+// Degenerate triangles (zero-area or with NaN vertices) get a NaN
+// normal; downstream consumers (e.g. mesh_marker) handle NaN gracefully.
+//
+// Because OrganizedFastMesh runs on the (already-transformed) target-
+// frame cloud, the returned normals are in target_frame as well —
+// slope angle = arccos(|n_z|) is then directly meaningful.
+std::vector<Eigen::Vector3f> compute_face_normals(const pcl::PolygonMesh & mesh);
 
 }  // namespace realsense_fast_mesh_baseline
 

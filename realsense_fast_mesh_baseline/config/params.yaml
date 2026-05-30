@@ -47,19 +47,12 @@ local_fast_mesh_node:
     # below may need to scale roughly linearly with stride.
     pixel_stride:             10
 
-    # ---- IntegralImageNormalEstimation ----
-    # Patch size (image pixels) over which the local plane is fitted to
-    # estimate the normal. Larger = smoother normals, less per-pixel
-    # noise, but small terrain features get washed out.
-    normal_smoothing_size:    20.0
-    # Depth discontinuity threshold (m). If |z_i - z_j| / z_i exceeds
-    # this between adjacent pixels, the normal estimator treats the edge
-    # as a discontinuity. NOTE: this assumes the cloud is in *camera*
-    # coordinates where z is the optical depth axis — that's why we run
-    # normal estimation BEFORE transforming the cloud to target_frame.
-    max_depth_change_factor:  0.02
-
     # ---- OrganizedFastMesh ----
+    # Normals are NOT computed per-pixel anymore — one face normal is
+    # derived from each triangle's vertices AFTER mesh build (see
+    # compute_face_normals in mesh_builder.cpp). Noise robustness comes
+    # from pixel_stride: larger stride = wider 3D triangle baseline =
+    # less per-vertex sensor-noise sensitivity per face normal.
     # Note: triangle_max_edge_length is NOT exposed here. The node
     # computes it at runtime as `pixel_stride * 0.10 m` so the
     # depth-discontinuity threshold scales naturally with vertex
@@ -76,12 +69,21 @@ local_fast_mesh_node:
 
     # ---- Visualization ----
     # The node publishes a MarkerArray with THREE markers per frame:
-    #   id=0  POINTS         — opaque vertex dots (point_size_m wide)
-    #   id=1  TRIANGLE_LIST  — faint mesh faces (alpha=face_alpha)
+    #   id=0  POINTS         — opaque vertex dots, colored by the slope
+    #                          of the AVERAGE incident-face normal
+    #                          (Gouraud-style across triangles using
+    #                          this vertex). Soft gradient look.
+    #   id=1  TRIANGLE_LIST  — flat-shaded faces. Each triangle's 3
+    #                          vertices share one color (= slope of the
+    #                          triangle's own face normal). Stepped look
+    #                          at orientation changes — that's what makes
+    #                          face boundaries clearly visible (good for
+    #                          downstream face-grouping eyeballing).
+    #                          Alpha = face_alpha.
     #   id=2  LINE_LIST      — wireframe edges in light gray
-    #                          (edge_width_m wide, alpha=edge_alpha)
-    # POINTS + TRIANGLE_LIST are slope-colored; LINE_LIST is a fixed
-    # neutral gray so it doesn't compete with the slope coloring.
+    #                          (edge_width_m wide, alpha=edge_alpha).
+    # LINE_LIST is a fixed neutral gray so it doesn't compete with the
+    # slope coloring on the faces.
     #
     # Slope angle (rad) at which the green→red color ramp starts and ends.
     color_min_slope_rad:      0.0

@@ -40,10 +40,6 @@ FastMeshNode::FastMeshNode()
   }
   builder_params_.max_distance_m =
     static_cast<float>(declare_parameter<double>("max_distance_m", 3.5));
-  builder_params_.normal_smoothing_size =
-    static_cast<float>(declare_parameter<double>("normal_smoothing_size", 20.0));
-  builder_params_.max_depth_change_factor =
-    static_cast<float>(declare_parameter<double>("max_depth_change_factor", 0.02));
   // triangle_max_edge_length is intentionally NOT a yaml knob — it
   // scales linearly with pixel_stride via kBaseEdgeLengthPerStride so
   // that the rejected-as-discontinuity threshold tracks vertex spacing
@@ -89,16 +85,13 @@ FastMeshNode::FastMeshNode()
 
   RCLCPP_INFO(get_logger(),
     "Subscribed to depth=%s + camera_info=%s -> target_frame=%s "
-    "pixel_stride=%u max_distance=%.2fm normal_smoothing=%.2fpx "
-    "max_depth_change=%.4f triangle_max_edge=%.3fm triangulation=%s "
-    "color_slope=[%.3f..%.3f]rad point_size=%.3fm face_alpha=%.2f "
-    "edge_width=%.4fm edge_alpha=%.2f",
+    "pixel_stride=%u max_distance=%.2fm triangle_max_edge=%.3fm "
+    "triangulation=%s color_slope=[%.3f..%.3f]rad point_size=%.3fm "
+    "face_alpha=%.2f edge_width=%.4fm edge_alpha=%.2f",
     depth_image_topic_.c_str(), camera_info_topic_.c_str(),
     target_frame_.c_str(),
     builder_params_.pixel_stride,
     builder_params_.max_distance_m,
-    builder_params_.normal_smoothing_size,
-    builder_params_.max_depth_change_factor,
     builder_params_.triangle_max_edge_length,
     triangulation_type_str(builder_params_.triangulation_type),
     marker_style_.color_min_slope_rad,
@@ -124,7 +117,7 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   }
 
   RCLCPP_INFO_ONCE(get_logger(),
-    "[1/7] First depth callback: encoding=%s %ux%u",
+    "[1/5] First depth callback: encoding=%s %ux%u",
     msg->encoding.c_str(), msg->width, msg->height);
 
   // ---- Build organized cloud from depth image + intrinsics ----
@@ -140,19 +133,10 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
     return;
   }
   RCLCPP_INFO_ONCE(get_logger(),
-    "[2/7] Cloud built: %ux%u (%zu pts) organized=%d is_dense=%d",
-    cam_cloud->width, cam_cloud->height, cam_cloud->points.size(),
-    static_cast<int>(cam_cloud->isOrganized()),
-    static_cast<int>(cam_cloud->is_dense));
+    "[2/5] Cloud built: %ux%u (%zu pts)",
+    cam_cloud->width, cam_cloud->height, cam_cloud->points.size());
 
-  // ---- Estimate normals on CAMERA-frame cloud (z = optical depth) ----
-  auto cam_normals = estimate_normals(cam_cloud, builder_params_);
-  RCLCPP_INFO_ONCE(get_logger(),
-    "[3/7] Normals estimated: %zu pts (organized=%d)",
-    cam_normals->points.size(),
-    static_cast<int>(cam_normals->isOrganized()));
-
-  // ---- TF lookup (mirror surfel/elev mapper) ----
+  // ---- TF lookup ----
   const tf2::TimePoint lookup_time =
     use_latest_tf_
       ? tf2::TimePointZero
@@ -173,7 +157,6 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   }
   const rclcpp::Time out_stamp =
     use_latest_tf_ ? this->now() : rclcpp::Time(msg->header.stamp);
-  RCLCPP_INFO_ONCE(get_logger(), "[4/7] TF lookup ok");
 
   // ---- Transform cloud into target frame (preserves organized) ----
   // Build the Affine3f via an explicit Matrix4f cast (avoids the
@@ -185,40 +168,21 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   auto tgt_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::transformPointCloud(*cam_cloud, *tgt_cloud, transform_f);
   RCLCPP_INFO_ONCE(get_logger(),
-    "[5/7] Cloud transformed: %ux%u organized=%d",
-    tgt_cloud->width, tgt_cloud->height,
-    static_cast<int>(tgt_cloud->isOrganized()));
-
-  // ---- Rotate normals into target frame (rotation only) ----
-  // Use Matrix4f top-left block for the rotation — same rationale as
-  // above, avoids the transform_f.linear() Block-to-Matrix3f path.
-  const Eigen::Matrix3f R = T4.topLeftCorner<3, 3>();
-  auto tgt_normals = pcl::PointCloud<pcl::Normal>::Ptr(new pcl::PointCloud<pcl::Normal>);
-  tgt_normals->width  = cam_normals->width;
-  tgt_normals->height = cam_normals->height;
-  tgt_normals->is_dense = cam_normals->is_dense;
-  tgt_normals->points.resize(cam_normals->points.size());
-  for (std::size_t i = 0; i < cam_normals->points.size(); ++i) {
-    const auto & nc = cam_normals->points[i];
-    Eigen::Vector3f n_in(nc.normal_x, nc.normal_y, nc.normal_z);
-    const Eigen::Vector3f n_out = R * n_in;
-    auto & no = tgt_normals->points[i];
-    no.normal_x = n_out.x();
-    no.normal_y = n_out.y();
-    no.normal_z = n_out.z();
-    no.curvature = nc.curvature;
-  }
-  RCLCPP_INFO_ONCE(get_logger(), "[6/7] Normals rotated");
+    "[3/5] Cloud transformed to %s", target_frame_.c_str());
 
   // ---- Build mesh on the target-frame cloud ----
   pcl::PolygonMesh mesh = build_fast_mesh(tgt_cloud, builder_params_);
   RCLCPP_INFO_ONCE(get_logger(),
-    "[7/7] Mesh built: %zu polygons", mesh.polygons.size());
+    "[4/5] Mesh built: %zu polygons", mesh.polygons.size());
+
+  // ---- Per-face normals (in target frame, since mesh is in target frame) ----
+  const std::vector<Eigen::Vector3f> face_normals = compute_face_normals(mesh);
 
   // ---- Serialize to MarkerArray + publish ----
   auto marker_array = mesh_to_marker_array(
-    mesh, *tgt_normals, out_stamp, target_frame_, marker_style_);
+    mesh, face_normals, out_stamp, target_frame_, marker_style_);
   pub_marker_->publish(std::move(marker_array));
+  RCLCPP_INFO_ONCE(get_logger(), "[5/5] MarkerArray published");
 }
 
 }  // namespace realsense_fast_mesh_baseline

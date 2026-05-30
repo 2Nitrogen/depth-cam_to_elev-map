@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 #include <pcl/conversions.h>
-#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -24,60 +26,79 @@ std_msgs::msg::ColorRGBA slope_color(double t, double alpha)
   return c;
 }
 
-// Slope (rad) of a vertex's normal relative to +z. NaN-safe: returns
-// 0 (flat) for degenerate / missing normals.
-double slope_from_normal(const pcl::Normal & n)
+// Slope angle (rad) of a unit-or-near-unit normal relative to +z. NaN-
+// safe: returns 0 (flat) for degenerate / NaN normals.
+double slope_from_normal(const Eigen::Vector3f & n)
 {
-  const float nx = n.normal_x;
-  const float ny = n.normal_y;
-  const float nz = n.normal_z;
-  if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) {
+  if (!n.allFinite()) {
     return 0.0;
   }
-  const double mag = std::sqrt(
-    static_cast<double>(nx) * nx +
-    static_cast<double>(ny) * ny +
-    static_cast<double>(nz) * nz);
-  if (mag <= 0.0) {
+  const double mag = n.norm();
+  if (!(mag > 0.0)) {
     return 0.0;
   }
-  const double cos_abs = std::min(1.0, std::abs(static_cast<double>(nz) / mag));
+  const double cos_abs = std::min(1.0, std::abs(static_cast<double>(n.z()) / mag));
   return std::acos(cos_abs);
 }
 
 double slope_to_ramp_t(
-  const pcl::Normal & n,
+  const Eigen::Vector3f & n,
   const MarkerStyle & style,
   double slope_range)
 {
-  const double slope = slope_from_normal(n);
-  return (slope - style.color_min_slope_rad) / slope_range;
+  return (slope_from_normal(n) - style.color_min_slope_rad) / slope_range;
 }
 
 }  // namespace
 
 visualization_msgs::msg::MarkerArray mesh_to_marker_array(
   const pcl::PolygonMesh & mesh,
-  const pcl::PointCloud<pcl::Normal> & vertex_normals,
+  const std::vector<Eigen::Vector3f> & face_normals,
   const rclcpp::Time & stamp,
   const std::string & frame_id,
   const MarkerStyle & style)
 {
   visualization_msgs::msg::MarkerArray arr;
 
-  // Extract vertices from PCL's serialized cloud format into an
-  // in-memory PointCloud<PointXYZ> for index-based access.
+  // Extract vertices from PCL's serialized cloud format into an in-
+  // memory PointCloud<PointXYZ> for index-based access.
   pcl::PointCloud<pcl::PointXYZ> vertices;
   pcl::fromPCLPointCloud2(mesh.cloud, vertices);
 
   const std::size_t n_vertices = vertices.points.size();
-  const std::size_t n_normals  = vertex_normals.points.size();
-  const bool have_normals = (n_normals == n_vertices);
+  const std::size_t n_polys    = mesh.polygons.size();
+  const bool have_face_normals = (face_normals.size() == n_polys);
 
   const double slope_range =
     std::max(1e-6, style.color_max_slope_rad - style.color_min_slope_rad);
 
-  // ---- Marker id=0: POINTS (vertices, opaque) -----------------------
+  // ---- Per-vertex aggregated normal (for POINTS Gouraud color) ------
+  // Each vertex accumulates the (face_normal) of every triangle that
+  // references it. A single pass over polygons populates the sums; we
+  // do not normalize per-vertex (slope_from_normal handles arbitrary
+  // magnitudes), so this is mathematically a weighted-by-incidence
+  // average direction.
+  std::vector<Eigen::Vector3f> vertex_normal_sums(n_vertices, Eigen::Vector3f::Zero());
+  if (have_face_normals) {
+    for (std::size_t fi = 0; fi < n_polys; ++fi) {
+      const auto & poly = mesh.polygons[fi];
+      if (poly.vertices.size() != 3) {
+        continue;
+      }
+      const Eigen::Vector3f & nf = face_normals[fi];
+      if (!nf.allFinite()) {
+        continue;
+      }
+      for (std::size_t k = 0; k < 3; ++k) {
+        const std::uint32_t idx = poly.vertices[k];
+        if (idx < n_vertices) {
+          vertex_normal_sums[idx] += nf;
+        }
+      }
+    }
+  }
+
+  // ---- Marker id=0: POINTS (vertices, opaque, Gouraud color) --------
   visualization_msgs::msg::Marker pts;
   pts.header.stamp = stamp;
   pts.header.frame_id = frame_id;
@@ -86,7 +107,6 @@ visualization_msgs::msg::MarkerArray mesh_to_marker_array(
   pts.type = visualization_msgs::msg::Marker::POINTS;
   pts.action = visualization_msgs::msg::Marker::ADD;
   pts.pose.orientation.w = 1.0;
-  // For POINTS: scale.x = width (m), scale.y = height (m) in world.
   pts.scale.x = style.point_size_m;
   pts.scale.y = style.point_size_m;
 
@@ -103,14 +123,14 @@ visualization_msgs::msg::MarkerArray mesh_to_marker_array(
     pts.points.push_back(p);
 
     double t = 0.0;
-    if (have_normals) {
-      t = slope_to_ramp_t(vertex_normals.points[i], style, slope_range);
+    if (have_face_normals) {
+      t = slope_to_ramp_t(vertex_normal_sums[i], style, slope_range);
     }
     pts.colors.push_back(slope_color(t, 1.0));  // opaque
   }
   arr.markers.push_back(std::move(pts));
 
-  // ---- Marker id=1: TRIANGLE_LIST (faces, faint) --------------------
+  // ---- Marker id=1: TRIANGLE_LIST (faces, flat shading, faint) ------
   visualization_msgs::msg::Marker tris;
   tris.header.stamp = stamp;
   tris.header.frame_id = frame_id;
@@ -119,19 +139,27 @@ visualization_msgs::msg::MarkerArray mesh_to_marker_array(
   tris.type = visualization_msgs::msg::Marker::TRIANGLE_LIST;
   tris.action = visualization_msgs::msg::Marker::ADD;
   tris.pose.orientation.w = 1.0;
-  // TRIANGLE_LIST: scale is unused but must be non-zero to avoid
-  // rendering as a degenerate marker in some RViz versions.
   tris.scale.x = 1.0;
   tris.scale.y = 1.0;
   tris.scale.z = 1.0;
 
-  tris.points.reserve(mesh.polygons.size() * 3);
-  tris.colors.reserve(mesh.polygons.size() * 3);
+  tris.points.reserve(n_polys * 3);
+  tris.colors.reserve(n_polys * 3);
 
-  for (const auto & poly : mesh.polygons) {
+  for (std::size_t fi = 0; fi < n_polys; ++fi) {
+    const auto & poly = mesh.polygons[fi];
     if (poly.vertices.size() != 3) {
-      continue;  // OrganizedFastMesh always emits triangles; defensive.
+      continue;
     }
+    // Per-face color: one slope_color computed once from the face's
+    // normal, then assigned to all 3 vertices of the triangle (flat
+    // shading).
+    double t = 0.0;
+    if (have_face_normals) {
+      t = slope_to_ramp_t(face_normals[fi], style, slope_range);
+    }
+    const auto face_col = slope_color(t, style.face_alpha);
+
     for (std::size_t k = 0; k < 3; ++k) {
       const std::uint32_t idx = poly.vertices[k];
       if (idx >= n_vertices) {
@@ -141,20 +169,12 @@ visualization_msgs::msg::MarkerArray mesh_to_marker_array(
       geometry_msgs::msg::Point p;
       p.x = v.x; p.y = v.y; p.z = v.z;
       tris.points.push_back(p);
-
-      double t = 0.0;
-      if (have_normals) {
-        t = slope_to_ramp_t(vertex_normals.points[idx], style, slope_range);
-      }
-      tris.colors.push_back(slope_color(t, style.face_alpha));
+      tris.colors.push_back(face_col);
     }
   }
   arr.markers.push_back(std::move(tris));
 
   // ---- Marker id=2: LINE_LIST (wireframe edges, light gray) ---------
-  // Per triangle (a, b, c) emit 3 line segments: (a,b), (b,c), (c,a).
-  // Shared edges between adjacent triangles get drawn twice — harmless
-  // for visualization and saves the dedup bookkeeping.
   visualization_msgs::msg::Marker lines;
   lines.header.stamp = stamp;
   lines.header.frame_id = frame_id;
@@ -163,18 +183,15 @@ visualization_msgs::msg::MarkerArray mesh_to_marker_array(
   lines.type = visualization_msgs::msg::Marker::LINE_LIST;
   lines.action = visualization_msgs::msg::Marker::ADD;
   lines.pose.orientation.w = 1.0;
-  // LINE_LIST: scale.x is line width in meters.
   lines.scale.x = style.edge_width_m;
 
-  // Per-marker color (light gray) — applied to all segments since we
-  // leave lines.colors empty.
   lines.color.r = 0.7f;
   lines.color.g = 0.7f;
   lines.color.b = 0.7f;
   lines.color.a = static_cast<float>(
     std::max(0.0, std::min(1.0, style.edge_alpha)));
 
-  lines.points.reserve(mesh.polygons.size() * 6);
+  lines.points.reserve(n_polys * 6);
 
   auto push_edge = [&](std::uint32_t i0, std::uint32_t i1) {
     if (i0 >= n_vertices || i1 >= n_vertices) {

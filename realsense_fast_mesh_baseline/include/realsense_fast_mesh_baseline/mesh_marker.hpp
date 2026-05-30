@@ -1,26 +1,32 @@
-// Convert a pcl::PolygonMesh + per-vertex normals into a
+// Convert a pcl::PolygonMesh + per-face normals into a
 // visualization_msgs/MarkerArray containing three markers:
 //
-//   id=0  POINTS         — opaque vertex dots (slope-colored).
-//   id=1  TRIANGLE_LIST  — faint triangle faces (slope-colored,
-//                          alpha = face_alpha).
-//   id=2  LINE_LIST      — wireframe edges (uniform light gray,
-//                          alpha = edge_alpha, width = edge_width_m).
+//   id=0  POINTS         — opaque vertex dots. Per-vertex color is the
+//                          slope of the AVERAGE incident face normal
+//                          (Gouraud-style — each vertex aggregates the
+//                          face_normals of the triangles using it).
+//   id=1  TRIANGLE_LIST  — faint triangle faces (slope-colored from
+//                          face_normals, flat shading: all 3 vertices
+//                          of a triangle share the face's color).
+//                          Alpha = face_alpha.
+//   id=2  LINE_LIST      — wireframe edges (uniform light gray, alpha
+//                          = edge_alpha, width = edge_width_m).
 //
-// Combined effect in RViz: vertex dots clearly visible, edges drawn
-// in pale gray to convey mesh connectivity, face surfaces softly
-// shaded behind. All three markers use action=ADD with fixed ids so
-// consecutive publishes overwrite the previous instances — no DELETE
-// bookkeeping needed.
+// Combined effect in RViz: vertex dots show smooth gradient across
+// curved regions, faces show flat per-triangle slope (cleanly stepped
+// at orientation changes), edges convey mesh connectivity. All three
+// markers use action=ADD with fixed ids so consecutive publishes
+// overwrite the previous instances — no DELETE bookkeeping needed.
 
 #ifndef REALSENSE_FAST_MESH_BASELINE__MESH_MARKER_HPP_
 #define REALSENSE_FAST_MESH_BASELINE__MESH_MARKER_HPP_
 
 #include <string>
+#include <vector>
+
+#include <Eigen/Core>
 
 #include <pcl/PolygonMesh.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
 
 #include <rclcpp/time.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -53,12 +59,13 @@ struct MarkerStyle
 };
 
 // Build the MarkerArray. `mesh.cloud` must be a pcl::PCLPointCloud2 of
-// pcl::PointXYZ in `frame_id` coordinates; `vertex_normals` must be
-// aligned 1:1 to that cloud (same index order) and expressed in the
-// SAME frame as the cloud.
+// pcl::PointXYZ in `frame_id` coordinates. `face_normals` must be 1:1
+// with mesh.polygons (same length, same order) — typically produced by
+// `compute_face_normals(mesh)` — and expressed in the SAME frame as
+// the mesh vertices.
 visualization_msgs::msg::MarkerArray mesh_to_marker_array(
   const pcl::PolygonMesh & mesh,
-  const pcl::PointCloud<pcl::Normal> & vertex_normals,
+  const std::vector<Eigen::Vector3f> & face_normals,
   const rclcpp::Time & stamp,
   const std::string & frame_id,
   const MarkerStyle & style);
