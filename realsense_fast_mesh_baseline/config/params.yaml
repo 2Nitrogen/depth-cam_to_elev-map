@@ -7,113 +7,43 @@ local_fast_mesh_node:
     # flag — many bags were recorded with that false, producing a
     # NaN-stripped / unorganized PointCloud2 that the PCL organized
     # algorithms cannot consume.
-    depth_image_topic:       /camera/camera/depth/image_rect_raw
-    camera_info_topic:       /camera/camera/depth/camera_info
-    mesh_marker_topic:       /local_fast_mesh/mesh
+    depth_image_topic:        /camera/camera/depth/image_rect_raw
+    camera_info_topic:        /camera/camera/depth/camera_info
+    accumulated_cloud_topic:  /local_fast_mesh/accumulated_cloud
 
     # ---- Frames ----
-    # target_frame: gravity-aligned frame the mesh is published in.
+    # target_frame: mapping frame the accumulated cloud is published in.
     # state_estimator publishes odom->base_link with roll/pitch from the
-    # IMU and translation=[0,0,0], so vertex z stays world-up even when
-    # the robot tilts (same convention as elev_mapper / surfel_mapper).
-    target_frame:            odom
+    # IMU and translation=[0,0,0], so the cloud's z stays gravity-up
+    # even when the robot tilts.
+    target_frame:             odom
 
     # ---- Timing / TF ----
-    tf_timeout_sec:          0.1
+    tf_timeout_sec:           0.1
     # When true, use latest available TF instead of msg->header.stamp.
     # Required when bag stamps and /clock are mismatched (RealSense
-    # sensor-time bags). Set to false once a time-varying estimator is
-    # in place and stamps are consistent.
-    use_latest_tf:           true
-    cloud_queue_size:        5
+    # sensor-time bags).
+    use_latest_tf:            true
+    cloud_queue_size:         5
 
     # ---- Range cutoff (spherical) ----
-    # Drop points whose distance from the camera origin (sqrt(x²+y²+z²)
-    # in the camera optical frame) exceeds max_distance_m. RealSense
-    # depth noise scales with depth², so far points are mostly noise; a
-    # spherical cutoff trims them before they cost any normal /
-    # triangulation work. Set to 0 (or negative) to disable.
+    # Drop points whose distance from the camera origin exceeds
+    # max_distance_m. RealSense depth noise scales with depth², so far
+    # points are mostly noise. Set to 0 (or negative) to disable.
     max_distance_m:           3.5
 
     # ---- Pixel stride (cloud downsampling) ----
-    # Take every Nth pixel of the depth image along both axes when
-    # reconstructing the organized cloud. stride=1 keeps every pixel
-    # (densest mesh, ~vertex count = image resolution); stride=2 quarters
-    # the vertex count (4x fewer); stride=N gives N²-fold reduction.
-    # The output cloud stays organized so OrganizedFastMesh still works.
-    # Heuristic: if mesh looks "painted" / triangles are sub-pixel, bump
-    # stride up to 3-4. Note: increasing stride means vertices are
-    # farther apart in 3D at the same depth, so triangle_max_edge_length
-    # below may need to scale roughly linearly with stride.
+    # Take every Nth pixel along both axes when reconstructing the
+    # organized cloud. stride=N gives N²-fold vertex reduction. The
+    # output stays organized — width/height shrink to (W/N, H/N).
     pixel_stride:             10
 
-    # ---- OrganizedFastMesh + post-mesh normal smoothing ----
-    # Normals are NOT computed per-pixel anymore — one face normal is
-    # derived from each triangle's vertices AFTER mesh build (see
-    # compute_face_normals in mesh_builder.cpp). Coarse noise robustness
-    # comes from pixel_stride: larger stride = wider 3D triangle
-    # baseline = less per-vertex sensor-noise sensitivity per face
-    # normal.
-    #
-    # Fine noise robustness comes from a Laplacian smoothing pass on
-    # the face graph (see smooth_face_normals). Each iteration replaces
-    # every face's normal with a weighted average of itself and its
-    # 1-ring neighbors (faces sharing an edge):
-    #   n_i' = normalize( alpha * n_i + (1 - alpha) * mean(n_j ∈ N(i)) )
-    # OrganizedFastMesh already cuts the mesh at depth discontinuities
-    # (triangle_max_edge_length), so the graph is naturally
-    # edge-preserving — smoothing does NOT propagate across step edges
-    # / wall corners. Within a continuous surface, adjacent faces' raw
-    # normals get pulled toward each other, which means "any single
-    # face's slope" becomes a stable estimate (good for foothold-style
-    # downstream queries).
-    normal_smoothing_iterations:  2     # 0 = off; 1-2 typical; >3 may over-smooth small features
-    normal_smoothing_self_weight: 0.5   # 1.0 = no effect (keep self); 0.0 = pure neighbor average
-    # Note: triangle_max_edge_length is NOT exposed here. The node
-    # computes it at runtime as `pixel_stride * 0.10 m` so the
-    # depth-discontinuity threshold scales naturally with vertex
-    # spacing. Edit kBaseEdgeLengthPerStride in mesh_builder.hpp if you
-    # need to retune the base unit.
-    # Triangulation pattern. Valid:
-    #   TRIANGLE_RIGHT_CUT      (each quad cut along the "\" diagonal)
-    #   TRIANGLE_LEFT_CUT       (each quad cut along the "/" diagonal)
-    #   TRIANGLE_ADAPTIVE_CUT   (pick the diagonal that yields smaller edge)
-    #   QUAD_MESH               (output 4-vertex polygons, not triangles —
-    #                            note the Marker output is always TRIANGLE_LIST
-    #                            so QUAD_MESH is rejected at load time)
-    triangulation_type:       "TRIANGLE_ADAPTIVE_CUT"
-
-    # ---- Visualization ----
-    # The node publishes a MarkerArray with THREE markers per frame:
-    #   id=0  POINTS         — opaque vertex dots, colored by the slope
-    #                          of the AVERAGE incident-face normal
-    #                          (Gouraud-style across triangles using
-    #                          this vertex). Soft gradient look.
-    #   id=1  TRIANGLE_LIST  — flat-shaded faces. Each triangle's 3
-    #                          vertices share one color (= slope of the
-    #                          triangle's own face normal). Stepped look
-    #                          at orientation changes — that's what makes
-    #                          face boundaries clearly visible (good for
-    #                          downstream face-grouping eyeballing).
-    #                          Alpha = face_alpha.
-    #   id=2  LINE_LIST      — wireframe edges in light gray
-    #                          (edge_width_m wide, alpha=edge_alpha).
-    # LINE_LIST is a fixed neutral gray so it doesn't compete with the
-    # slope coloring on the faces.
-    #
-    # Slope angle (rad) at which the green→red color ramp starts and ends.
-    color_min_slope_rad:      0.0
-    color_max_slope_rad:      0.785   # ~45 deg
-    # Vertex point size (m, world-scale). Roughly tune to the typical
-    # inter-vertex spacing at your working depth so dots don't overlap
-    # too much. With pixel_stride=10 at depth 1m, ~17mm spacing, so
-    # 0.01 m (10 mm) gives visible but non-touching dots.
-    point_size_m:             0.01
-    # Triangle face alpha in [0, 1]. Lower = more see-through, lets
-    # the vertex dots dominate the visualization.
-    face_alpha:               0.3
-    # Wireframe edge line width (m, world-scale) and alpha in [0, 1].
-    # Default is a thin pale gray (2 mm, 50% alpha) — strong enough to
-    # convey mesh connectivity but subordinate to the slope colors.
-    edge_width_m:             0.002
-    edge_alpha:               0.5
+    # ---- K-frame accumulation ----
+    # Most recent K frames of (target-frame-transformed) point clouds
+    # are kept in a FIFO buffer. Every callback publishes the union of
+    # all buffered frames as a single PointCloud2 — the same physical
+    # point appears up to K times if observed from K different frames.
+    # This is the raw substrate the downstream Gaussian-boundary
+    # correspondence + mesh extractor is designed to consume; this
+    # node intentionally does NO fusion / smoothing / dedup itself.
+    buffer_size_k:            10

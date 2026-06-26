@@ -14,21 +14,17 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
-find_package(tf2_sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common features surface)
+find_package(PCL REQUIRED COMPONENTS common)
 find_package(Eigen3 REQUIRED)
 
 add_executable(local_fast_mesh_node
   src/main.cpp
   src/fast_mesh_node.cpp
   src/mesh_builder.cpp
-  src/mesh_marker.cpp
 )
 
 target_include_directories(local_fast_mesh_node PRIVATE
@@ -46,12 +42,9 @@ ament_target_dependencies(local_fast_mesh_node
   rclcpp
   sensor_msgs
   geometry_msgs
-  std_msgs
-  visualization_msgs
   tf2
   tf2_ros
   tf2_eigen
-  tf2_sensor_msgs
   pcl_conversions
 )
 

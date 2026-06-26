@@ -1,6 +1,7 @@
 #include "realsense_fast_mesh_baseline/fast_mesh_node.hpp"
 
-#include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <functional>
 #include <utility>
 
@@ -8,6 +9,7 @@
 #include <Eigen/Geometry>
 
 #include <pcl/common/transforms.h>
+#include <pcl_conversions/pcl_conversions.h>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2/exceptions.h>
@@ -24,53 +26,25 @@ FastMeshNode::FastMeshNode()
     "depth_image_topic", "/camera/camera/depth/image_rect_raw");
   camera_info_topic_ = declare_parameter<std::string>(
     "camera_info_topic", "/camera/camera/depth/camera_info");
-  mesh_marker_topic_ = declare_parameter<std::string>(
-    "mesh_marker_topic", "/local_fast_mesh/mesh");
-  target_frame_      = declare_parameter<std::string>("target_frame", "odom");
+  accumulated_cloud_topic_ = declare_parameter<std::string>(
+    "accumulated_cloud_topic", "/local_fast_mesh/accumulated_cloud");
+  target_frame_ = declare_parameter<std::string>("target_frame", "odom");
 
   tf_timeout_sec_   = declare_parameter<double>("tf_timeout_sec",   0.1);
   use_latest_tf_    = declare_parameter<bool>(  "use_latest_tf",    true);
   cloud_queue_size_ = declare_parameter<int>(   "cloud_queue_size", 5);
 
-  // pixel_stride: ROS2 parameter API doesn't have uint32, so accept as
-  // int (default 1) and clamp to >=1 before stashing.
   {
     const int s = declare_parameter<int>("pixel_stride", 1);
     builder_params_.pixel_stride = static_cast<std::uint32_t>(std::max(1, s));
   }
   builder_params_.max_distance_m =
     static_cast<float>(declare_parameter<double>("max_distance_m", 3.5));
-  // triangle_max_edge_length is intentionally NOT a yaml knob — it
-  // scales linearly with pixel_stride via kBaseEdgeLengthPerStride so
-  // that the rejected-as-discontinuity threshold tracks vertex spacing
-  // automatically. See mesh_builder.hpp for the rationale.
-  builder_params_.triangle_max_edge_length =
-    static_cast<float>(builder_params_.pixel_stride) * kBaseEdgeLengthPerStride;
-  builder_params_.triangulation_type = parse_triangulation_type(
-    declare_parameter<std::string>("triangulation_type", "TRIANGLE_ADAPTIVE_CUT"));
 
-  // Face-normal Laplacian smoothing. iterations clamped to >=0;
-  // self_weight clamped on use (smooth_face_normals does this).
   {
-    const int it = declare_parameter<int>("normal_smoothing_iterations", 1);
-    builder_params_.normal_smoothing_iterations =
-      static_cast<std::uint32_t>(std::max(0, it));
+    const int k = declare_parameter<int>("buffer_size_k", 10);
+    buffer_size_k_ = static_cast<std::uint32_t>(std::max(1, k));
   }
-  builder_params_.normal_smoothing_self_weight =
-    static_cast<float>(declare_parameter<double>("normal_smoothing_self_weight", 0.5));
-
-  marker_style_.color_min_slope_rad =
-    declare_parameter<double>("color_min_slope_rad", 0.0);
-  marker_style_.color_max_slope_rad =
-    declare_parameter<double>("color_max_slope_rad", 0.785);
-  marker_style_.point_size_m =
-    declare_parameter<double>("point_size_m", 0.01);
-  marker_style_.face_alpha =
-    declare_parameter<double>("face_alpha", 0.3);
-  marker_style_.edge_width_m =
-    declare_parameter<double>("edge_width_m", 0.002);
-  marker_style_.edge_alpha =
-    declare_parameter<double>("edge_alpha", 0.5);
 
   // ---- TF ----
   tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -84,35 +58,22 @@ FastMeshNode::FastMeshNode()
   sub_depth_ = create_subscription<sensor_msgs::msg::Image>(
     depth_image_topic_, sensor_qos,
     std::bind(&FastMeshNode::on_depth_image, this, std::placeholders::_1));
-  // CameraInfo is published with a reliability QoS on the wrapper side;
-  // use a small KEEP_LAST + reliable subscription. We only need the
-  // latest value, so depth=1 is enough.
   sub_info_ = create_subscription<sensor_msgs::msg::CameraInfo>(
     camera_info_topic_, rclcpp::QoS{1}.reliable(),
     std::bind(&FastMeshNode::on_camera_info, this, std::placeholders::_1));
-  pub_marker_ =
-    create_publisher<visualization_msgs::msg::MarkerArray>(mesh_marker_topic_, 1);
+  pub_cloud_ =
+    create_publisher<sensor_msgs::msg::PointCloud2>(accumulated_cloud_topic_, 1);
 
   RCLCPP_INFO(get_logger(),
     "Subscribed to depth=%s + camera_info=%s -> target_frame=%s "
-    "pixel_stride=%u max_distance=%.2fm triangle_max_edge=%.3fm "
-    "triangulation=%s smoothing=%u iter alpha=%.2f "
-    "color_slope=[%.3f..%.3f]rad point_size=%.3fm "
-    "face_alpha=%.2f edge_width=%.4fm edge_alpha=%.2f",
+    "pixel_stride=%u max_distance=%.2fm buffer_K=%u "
+    "publishing accumulated cloud on %s",
     depth_image_topic_.c_str(), camera_info_topic_.c_str(),
     target_frame_.c_str(),
     builder_params_.pixel_stride,
     builder_params_.max_distance_m,
-    builder_params_.triangle_max_edge_length,
-    triangulation_type_str(builder_params_.triangulation_type),
-    builder_params_.normal_smoothing_iterations,
-    builder_params_.normal_smoothing_self_weight,
-    marker_style_.color_min_slope_rad,
-    marker_style_.color_max_slope_rad,
-    marker_style_.point_size_m,
-    marker_style_.face_alpha,
-    marker_style_.edge_width_m,
-    marker_style_.edge_alpha);
+    buffer_size_k_,
+    accumulated_cloud_topic_.c_str());
 }
 
 void FastMeshNode::on_camera_info(sensor_msgs::msg::CameraInfo::ConstSharedPtr msg)
@@ -130,7 +91,7 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   }
 
   RCLCPP_INFO_ONCE(get_logger(),
-    "[1/5] First depth callback: encoding=%s %ux%u",
+    "[1/4] First depth callback: encoding=%s %ux%u",
     msg->encoding.c_str(), msg->width, msg->height);
 
   // ---- Build organized cloud from depth image + intrinsics ----
@@ -146,7 +107,7 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
     return;
   }
   RCLCPP_INFO_ONCE(get_logger(),
-    "[2/5] Cloud built: %ux%u (%zu pts)",
+    "[2/4] Cloud built: %ux%u (%zu pts)",
     cam_cloud->width, cam_cloud->height, cam_cloud->points.size());
 
   // ---- TF lookup ----
@@ -171,47 +132,51 @@ void FastMeshNode::on_depth_image(sensor_msgs::msg::Image::ConstSharedPtr msg)
   const rclcpp::Time out_stamp =
     use_latest_tf_ ? this->now() : rclcpp::Time(msg->header.stamp);
 
-  // ---- Transform cloud into target frame (preserves organized) ----
-  // Build the Affine3f via an explicit Matrix4f cast (avoids the
-  // Isometry3f-to-Affine3f constructor path that has been observed to
-  // misbehave on some PCL 1.12 / Eigen 3.4 combinations).
+  // ---- Transform cloud into target frame ----
   const Eigen::Isometry3d transform_d = tf2::transformToEigen(tf_cam_to_target.transform);
   const Eigen::Matrix4f T4 = transform_d.matrix().cast<float>();
   const Eigen::Affine3f transform_f(T4);
   auto tgt_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::transformPointCloud(*cam_cloud, *tgt_cloud, transform_f);
   RCLCPP_INFO_ONCE(get_logger(),
-    "[3/5] Cloud transformed to %s", target_frame_.c_str());
+    "[3/4] Cloud transformed to %s", target_frame_.c_str());
 
-  // ---- Build mesh on the target-frame cloud ----
-  pcl::PolygonMesh mesh = build_fast_mesh(tgt_cloud, builder_params_);
-  RCLCPP_INFO_ONCE(get_logger(),
-    "[4/5] Mesh built: %zu polygons", mesh.polygons.size());
-
-  // ---- Per-face normals (raw, from triangle vertices) ----
-  const std::vector<Eigen::Vector3f> raw_face_normals = compute_face_normals(mesh);
-
-  // ---- Laplacian smoothing on the face graph (skipped when iter=0) ----
-  // Build the face adjacency once and reuse for smoothing. Mesh is
-  // already cut at depth discontinuities by OrganizedFastMesh, so the
-  // graph naturally splits at step edges — smoothing won't bleed
-  // across them.
-  std::vector<Eigen::Vector3f> face_normals;
-  if (builder_params_.normal_smoothing_iterations > 0u) {
-    const auto adjacency = compute_face_adjacency(mesh);
-    face_normals = smooth_face_normals(
-      raw_face_normals, adjacency,
-      builder_params_.normal_smoothing_iterations,
-      builder_params_.normal_smoothing_self_weight);
-  } else {
-    face_normals = raw_face_normals;
+  // ---- Push to K-frame FIFO buffer ----
+  cloud_buffer_.push_back(tgt_cloud);
+  while (cloud_buffer_.size() > buffer_size_k_) {
+    cloud_buffer_.pop_front();
   }
 
-  // ---- Serialize to MarkerArray + publish ----
-  auto marker_array = mesh_to_marker_array(
-    mesh, face_normals, out_stamp, target_frame_, marker_style_);
-  pub_marker_->publish(std::move(marker_array));
-  RCLCPP_INFO_ONCE(get_logger(), "[5/5] MarkerArray published");
+  // ---- Concatenate buffered clouds, drop NaN, publish ----
+  pcl::PointCloud<pcl::PointXYZ> accumulated;
+  std::size_t reserve_total = 0;
+  for (const auto & c : cloud_buffer_) {
+    reserve_total += c->points.size();
+  }
+  accumulated.points.reserve(reserve_total);
+  for (const auto & c : cloud_buffer_) {
+    for (const auto & pt : c->points) {
+      if (std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z)) {
+        accumulated.points.push_back(pt);
+      }
+    }
+  }
+  accumulated.width = static_cast<std::uint32_t>(accumulated.points.size());
+  accumulated.height = 1u;
+  accumulated.is_dense = true;
+
+  sensor_msgs::msg::PointCloud2 out_msg;
+  pcl::toROSMsg(accumulated, out_msg);
+  out_msg.header.stamp = out_stamp;
+  out_msg.header.frame_id = target_frame_;
+  const std::size_t out_points = accumulated.points.size();
+  pub_cloud_->publish(std::move(out_msg));
+  RCLCPP_INFO_ONCE(get_logger(),
+    "[4/4] First accumulated cloud published (buf=%zu, points=%zu)",
+    cloud_buffer_.size(), out_points);
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+    "Published: buf=%zu  points=%zu",
+    cloud_buffer_.size(), out_points);
 }
 
 }  // namespace realsense_fast_mesh_baseline

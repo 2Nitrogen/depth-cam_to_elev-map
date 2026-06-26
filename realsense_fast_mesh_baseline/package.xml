@@ -4,12 +4,12 @@
   <name>realsense_fast_mesh_baseline</name>
   <version>0.1.0</version>
   <description>
-    Vanilla single-frame mesh baseline. Subscribes to an organized depth
-    PointCloud2, runs pcl::IntegralImageNormalEstimation +
-    pcl::OrganizedFastMesh, and publishes a visualization_msgs/Marker
-    (TRIANGLE_LIST) with per-vertex slope coloring. Acts as the reference
-    "what does PCL give us for free?" baseline against which custom
-    mesh / surfel work is compared.
+    K-frame raw point cloud accumulator. Subscribes to a depth Image +
+    CameraInfo, reconstructs an organized PointCloud per frame,
+    transforms it into the mapping (gravity-aligned) frame, keeps the
+    most recent K frames in a FIFO buffer, and publishes the union as
+    a single PointCloud2 every callback. No mesh, no fusion — raw
+    substrate for downstream correspondence + mesh-extraction work.
   </description>
   <maintainer email="dev@sequorrobotics.com">sequor</maintainer>
   <license>Apache-2.0</license>
@@ -19,12 +19,9 @@
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>visualization_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_eigen</depend>
-  <depend>tf2_sensor_msgs</depend>
   <depend>pcl_conversions</depend>
   <depend>libpcl-all-dev</depend>
   <depend>eigen</depend>
